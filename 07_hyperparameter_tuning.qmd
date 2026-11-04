@@ -1,0 +1,498 @@
+---
+title: "Stage 7 — Hyperparameter Tuning"
+subtitle: "CostConformal-Return (BCSE-207)"
+format:
+  html:
+    toc: true
+    code-fold: false
+    embed-resources: true
+execute:
+  warning: true
+  message: true
+---
+
+## Purpose
+
+Stage 6 fit a "model zoo" of 14 algorithms at fixed, sensible default settings. Stage 7 takes the four models that either (a) were the strongest or (b) had the most obvious room for improvement, and tunes them on the **validation** split:
+
+| Model | What is tuned | Grid size |
+|----|----|----|
+| Elastic-Net logistic | `alpha` (ridge ↔ lasso mix); `lambda` is chosen internally | 5 |
+| KNN | `k` (number of neighbours) | 5 |
+| Random Forest | `mtry`, `min.node.size` | 6 |
+| XGBoost | `max_depth`, `eta`; number of rounds found by early stopping | 9 |
+
+**Compute and RAM discipline:** one candidate fit at a time, `rm()` + `gc()` between candidates, grids kept small (5, 5, 6 and 9 candidates = 25 fits in total) instead of a full combinatorial sweep. XGBoost uses early stopping against a validation evaluation set instead of a separate `nrounds` grid dimension.
+
+**Selection metric:** validation AUC (ROC). Brier score is reported alongside because Stage 8 (conformal / cost-aware decisions) depends on probabilities being well calibrated, not just well ranked.
+
+**Methodological note (limitation):** XGBoost's early stopping watches the same `validation` split that is used to score AUC, so its tuned AUC is very slightly optimistic compared with the other three models, which never see validation labels while fitting. With only 20 rounds of patience the effect is tiny, but it should be stated in the report. The untouched `test` split is not used in this stage.
+
+## Setup
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath("."))
+source(file.path("R", "00_setup.R"))
+data.table::setDTthreads(2)
+
+required_packages <- c("DBI", "RSQLite", "glmnet", "ranger", "xgboost", "kknn")
+missing_packages <- setdiff(required_packages, rownames(installed.packages()))
+if (length(missing_packages) > 0) install.packages(missing_packages)
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+DEFAULT_TRAIN_CAP <- 250000
+KNN_TRAIN_N <- 8000; KNN_VAL_N <- 5000
+RF_NUM_TREES <- 200
+RF_SAMPLE_FRACTION <- 0.5
+HIST_MAX_BIN <- 128
+TREE_NUM_THREADS <- 2
+
+# ---- XGBoost helper -------------------------------------------------------
+# In xgboost 2.x/3.x the booster returned by xgb.train() is no longer a plain
+# list, so `fit$best_iteration` is NULL. Read the best round from the booster
+# attribute that early stopping writes (0-based), and fall back to the
+# evaluation log (lowest value of the watched metric) if that is missing.
+# Returns a 1-based number of rounds to use, or NA_integer_ if neither works.
+xgb_best_iter <- function(fit) {
+  b <- tryCatch(xgboost::xgb.attr(fit, "best_iteration"), error = function(e) NULL)
+  b <- suppressWarnings(as.integer(b))
+  if (length(b) == 1 && !is.na(b)) return(b + 1L)
+
+  elog <- attributes(fit)$evaluation_log
+  if (is.null(elog) || nrow(elog) == 0) return(NA_integer_)
+  metric <- as.numeric(elog[[ncol(elog)]])   # last column = metric early stopping watched
+  as.integer(which.min(metric))              # logloss: lower is better
+}
+
+MODEL_ZOO_TUNED_DIR <- file.path(MODEL_DIR, "model_zoo_tuned")
+dir.create(MODEL_ZOO_TUNED_DIR, showWarnings = FALSE, recursive = TRUE)
+DB_PATH <- file.path("data", "costconformal_return.sqlite")
+if (!file.exists(DB_PATH)) stop("Stage 5's database not found at ", DB_PATH, " -- run earlier stages first.")
+
+preprocessor <- readRDS(file.path(MODEL_DIR, "r_preprocessor.rds"))
+feature_selector <- readRDS(file.path(MODEL_DIR, "r_feature_selector.rds"))
+baseline_leaderboard <- fread(file.path(TABLE_DIR, "model_zoo_01_leaderboard.csv"))
+```
+
+## Load data
+
+Same loading logic as Stage 6: categorical columns get the factor levels frozen by the preprocessor (plus `"OTHER"`), and the binned columns get their fixed tier labels. Only `model_train` and `validation` are read.
+
+```{r load-data}
+bin_label_levels <- function(fs) {
+  bd <- fs$bin_definitions
+  list(
+    price_tier = c("Q1_low", "Q2", "Q3", "Q4_high")[seq_len(length(bd$price_breaks) - 1)],
+    customer_risk_tier = c("Low", "Mid", "High")[seq_len(length(bd$risk_breaks) - 1)]
+  )
+}
+BIN_LEVELS <- bin_label_levels(feature_selector)
+
+load_split_from_db <- function(con, split_name, preprocessor, feature_selector, bin_levels) {
+  dt <- as.data.table(DBI::dbGetQuery(con, paste0("SELECT * FROM ", split_name)))
+  for (col in feature_selector$categorical_features) {
+    if (col %in% names(dt)) {
+      levs <- union(preprocessor$allowed_levels[[col]], "OTHER")
+      set(dt, j = col, value = factor(dt[[col]], levels = levs))
+    }
+  }
+  for (col in names(bin_levels)) {
+    if (col %in% names(dt)) set(dt, j = col, value = factor(dt[[col]], levels = bin_levels[[col]]))
+  }
+  dt
+}
+
+con <- DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
+model_train_full <- load_split_from_db(con, "model_train", preprocessor, feature_selector, BIN_LEVELS)
+validation <- load_split_from_db(con, "validation", preprocessor, feature_selector, BIN_LEVELS)
+DBI::dbDisconnect(con)
+
+LINEAR_PREDICTORS <- unique(c(
+  feature_selector$linear_numeric_features, feature_selector$categorical_features,
+  feature_selector$binary_features, feature_selector$missingness_flags, feature_selector$binned_features
+))
+TREE_PREDICTORS <- unique(c(
+  feature_selector$tree_numeric_features, feature_selector$categorical_features,
+  feature_selector$binary_features, feature_selector$missingness_flags, feature_selector$binned_features
+))
+cat("model_train (full):", nrow(model_train_full), "rows | validation:", nrow(validation), "rows.\n")
+```
+
+## Helpers
+
+```{r helpers}
+stratified_sample <- function(dt, max_n) {
+  if (nrow(dt) <= max_n) return(dt)
+  frac <- max_n / nrow(dt)
+  dt[, .SD[sample(.N, size = max(1, round(.N * frac)))], by = isReturned]
+}
+
+build_onehot <- function(dt, predictors) {
+  model.matrix(as.formula(paste("~", paste(predictors, collapse = " + "), "- 1")), data = dt)
+}
+
+align_onehot <- function(x, train_colnames) {
+  missing_cols <- setdiff(train_colnames, colnames(x))
+  for (mc in missing_cols) x <- cbind(x, stats::setNames(data.frame(rep(0, nrow(x))), mc))
+  x[, train_colnames, drop = FALSE]
+}
+
+compute_metrics <- function(y, p) {
+  p <- pmin(pmax(p, 1e-6), 1 - 1e-6)
+  pred_class <- as.integer(p >= 0.5)
+  tp <- sum(pred_class == 1 & y == 1); fp <- sum(pred_class == 1 & y == 0)
+  tn <- sum(pred_class == 0 & y == 0); fn <- sum(pred_class == 0 & y == 1)
+  precision <- if ((tp + fp) == 0) NA_real_ else tp / (tp + fp)
+  recall <- if ((tp + fn) == 0) NA_real_ else tp / (tp + fn)
+  f1 <- if (is.na(precision) || is.na(recall) || (precision + recall) == 0) NA_real_ else 2 * precision * recall / (precision + recall)
+  data.table(
+    auc = auc_roc(y, p), pr_auc = pr_auc(y, p), brier = brier_score(y, p), log_loss = log_loss(y, p),
+    accuracy = (tp + tn) / length(y), precision = precision, recall = recall, f1 = f1
+  )
+}
+
+# Same lambda-selection logic Stage 6 used for its 3 fixed alphas -- lambda
+# is chosen on an 80/20 split carved OUT of train_sub (never validation),
+# then the final model is refit on the full train_sub at that lambda.
+fit_glmnet_selected <- function(train_sub, alpha) {
+  n <- nrow(train_sub)
+  tune_idx <- sample.int(n, size = round(0.2 * n))
+  fit_idx <- setdiff(seq_len(n), tune_idx)
+
+  x_fit <- build_onehot(train_sub[fit_idx], LINEAR_PREDICTORS)
+  path <- glmnet(x_fit, train_sub$isReturned[fit_idx], family = "binomial", alpha = alpha, standardize = TRUE)
+
+  x_tune <- build_onehot(train_sub[tune_idx], LINEAR_PREDICTORS)
+  pred_path <- predict(path, newx = x_tune, type = "response")
+  briers <- apply(pred_path, 2, function(p) brier_score(train_sub$isReturned[tune_idx], p))
+  best_lambda <- path$lambda[which.min(briers)]
+
+  x_full <- build_onehot(train_sub, LINEAR_PREDICTORS)
+  final_model <- glmnet(x_full, train_sub$isReturned, family = "binomial", alpha = alpha, lambda = best_lambda, standardize = TRUE)
+  list(model = final_model, lambda = best_lambda, predictors = LINEAR_PREDICTORS, train_colnames = colnames(x_full))
+}
+predict_glmnet_selected <- function(fit, newdata) {
+  x <- align_onehot(build_onehot(newdata, fit$predictors), fit$train_colnames)
+  as.numeric(predict(fit$model, newx = x, s = fit$lambda, type = "response"))
+}
+```
+
+## Frozen training pool
+
+All four tuners draw from the same 250,000-row stratified pool, so differences between candidates come from the hyperparameters and not from different training rows.
+
+```{r frozen-pool}
+set.seed(20260917)
+model_train <- stratified_sample(model_train_full, DEFAULT_TRAIN_CAP)
+rm(model_train_full)
+invisible(gc(verbose = FALSE))
+cat("model_train (frozen pool for this stage):", nrow(model_train), "rows.\n")
+```
+
+## 1. Elastic-Net — `alpha` grid
+
+`alpha = 0` is ridge, `alpha = 1` is lasso, values in between mix the two penalties. For each `alpha`, `lambda` is picked internally on a hold-out slice of the training data (never validation).
+
+```{r tune-elastic}
+elastic_alpha_grid <- c(0, 0.25, 0.5, 0.75, 1)
+
+elastic_results <- rbindlist(lapply(elastic_alpha_grid, function(a) {
+  cat("Elastic-Net alpha =", a, "\n")
+  set.seed(20260917)
+  train_sub <- stratified_sample(model_train, DEFAULT_TRAIN_CAP)
+  fit <- fit_glmnet_selected(train_sub, alpha = a)
+  prob <- predict_glmnet_selected(fit, validation)
+  m <- compute_metrics(validation$isReturned, prob)
+  m[, `:=`(alpha = a, lambda = fit$lambda)]
+  rm(train_sub, fit, prob); invisible(gc(verbose = FALSE))
+  m
+}))
+
+fwrite(elastic_results, file.path(TABLE_DIR, "tune_01_elastic_net_grid.csv"))
+elastic_results[order(-auc)]
+
+best_alpha_row <- elastic_results[order(-auc)][1]
+cat("Selected alpha =", best_alpha_row$alpha, "(highest validation AUC; lambda chosen internally per Stage 6's logic.)\n")
+```
+
+## 2. KNN — `k` grid
+
+KNN is a lazy learner and very memory-hungry, so it keeps Stage 6's small caps (8,000 training rows, 5,000 validation rows). The same subsamples are reused for every `k`.
+
+```{r tune-knn}
+knn_k_grid <- c(5, 10, 15, 25, 40)
+
+set.seed(20260917)
+knn_train_sub <- stratified_sample(model_train, KNN_TRAIN_N)
+knn_train_sub[, y_factor := factor(isReturned, levels = c(0, 1), labels = c("No", "Yes"))]
+
+knn_val_idx <- sort(sample.int(nrow(validation), KNN_VAL_N))
+knn_val_sub <- validation[knn_val_idx]
+knn_test_frame <- copy(knn_val_sub)
+knn_test_frame[, y_factor := factor(NA, levels = c("No", "Yes"))]
+
+knn_results <- rbindlist(lapply(knn_k_grid, function(k) {
+  cat("KNN k =", k, "\n")
+  res <- kknn::kknn(as.formula(paste("y_factor ~", paste(LINEAR_PREDICTORS, collapse = " + "))),
+                     train = knn_train_sub, test = knn_test_frame, k = k, kernel = "optimal", scale = TRUE)
+  prob <- as.numeric(res$prob[, "Yes"])
+  m <- compute_metrics(knn_val_sub$isReturned, prob)
+  m[, k := k]
+  m
+}))
+
+fwrite(knn_results, file.path(TABLE_DIR, "tune_02_knn_grid.csv"))
+knn_results[order(-auc)]
+
+best_k <- knn_results[order(-auc)][1, k]
+cat("Selected k =", best_k, "\n")
+```
+
+The best `k` is the largest value in the grid (40). That means the true optimum may be beyond the grid edge, which is worth one sentence in the report.
+
+## 3. Random Forest — `mtry` × `min.node.size` grid
+
+```{r tune-rf}
+rf_mtry_grid <- unique(pmax(1, c(
+  floor(sqrt(length(TREE_PREDICTORS))), floor(length(TREE_PREDICTORS) / 3), floor(length(TREE_PREDICTORS) / 2)
+)))
+rf_min_node_grid <- c(1, 10)
+rf_grid <- CJ(mtry = rf_mtry_grid, min_node_size = rf_min_node_grid)
+
+set.seed(20260917)
+rf_train_sub <- stratified_sample(model_train, DEFAULT_TRAIN_CAP)
+rf_train_sub[, y_factor := factor(isReturned, levels = c(0, 1), labels = c("No", "Yes"))]
+
+rf_results <- rbindlist(lapply(seq_len(nrow(rf_grid)), function(i) {
+  mtry_i <- rf_grid$mtry[i]; mns_i <- rf_grid$min_node_size[i]
+  cat("Random Forest mtry =", mtry_i, "min.node.size =", mns_i, "\n")
+  fit <- ranger::ranger(as.formula(paste("y_factor ~", paste(TREE_PREDICTORS, collapse = " + "))),
+                         data = rf_train_sub, num.trees = RF_NUM_TREES, probability = TRUE,
+                         mtry = mtry_i, min.node.size = mns_i, sample.fraction = RF_SAMPLE_FRACTION,
+                         num.threads = TREE_NUM_THREADS, seed = 20260917)
+  prob <- as.numeric(predict(fit, data = validation)$predictions[, "Yes"])
+  m <- compute_metrics(validation$isReturned, prob)
+  m[, `:=`(mtry = mtry_i, min_node_size = mns_i)]
+  rm(fit, prob); invisible(gc(verbose = FALSE))
+  m
+}))
+
+fwrite(rf_results, file.path(TABLE_DIR, "tune_03_random_forest_grid.csv"))
+rf_results[order(-auc)]
+
+best_rf_row <- rf_results[order(-auc)][1]
+rm(rf_train_sub); invisible(gc(verbose = FALSE))
+cat("Selected mtry =", best_rf_row$mtry, ", min.node.size =", best_rf_row$min_node_size, "\n")
+```
+
+## 4. XGBoost — `max_depth` × `eta` grid with early stopping
+
+Up to 500 rounds per candidate, stopping after 20 rounds with no improvement in validation log-loss. The number of rounds actually used is recorded as `best_nrounds`. Predictions use exactly that many trees (`iterationrange`), not the extra 20 trees grown while waiting for the stop.
+
+```{r tune-xgb}
+xgb_grid <- CJ(max_depth = c(4, 6, 8), eta = c(0.05, 0.1, 0.2))
+
+set.seed(20260917)
+xgb_train_sub <- stratified_sample(model_train, DEFAULT_TRAIN_CAP)
+x_train <- build_onehot(xgb_train_sub, TREE_PREDICTORS)
+dtrain <- xgboost::xgb.DMatrix(data = x_train, label = xgb_train_sub$isReturned)
+x_val <- align_onehot(build_onehot(validation, TREE_PREDICTORS), colnames(x_train))
+dval <- xgboost::xgb.DMatrix(data = x_val, label = validation$isReturned)
+
+xgb_results <- rbindlist(lapply(seq_len(nrow(xgb_grid)), function(i) {
+  md <- xgb_grid$max_depth[i]; eta_i <- xgb_grid$eta[i]
+  cat("XGBoost max_depth =", md, "eta =", eta_i, "\n")
+  fit <- xgboost::xgb.train(
+    params = list(objective = "binary:logistic", eval_metric = "logloss",
+                  max_depth = md, eta = eta_i,
+                  nthread = TREE_NUM_THREADS, max_bin = HIST_MAX_BIN),
+    data = dtrain, nrounds = 500, evals = list(val = dval),
+    early_stopping_rounds = 20, verbose = 0
+  )
+  best_it <- xgb_best_iter(fit)
+  if (is.na(best_it)) stop("Could not read best iteration from the xgboost fit -- inspect str(attributes(fit)).")
+  # iterationrange is 1-based with an exclusive upper bound -> first best_it trees
+  prob <- as.numeric(predict(fit, newdata = x_val, iterationrange = c(1, best_it + 1)))
+  m <- compute_metrics(validation$isReturned, prob)
+  m[, `:=`(max_depth = md, eta = eta_i, best_nrounds = best_it)]
+  rm(fit); invisible(gc(verbose = FALSE))
+  m
+}))
+
+fwrite(xgb_results, file.path(TABLE_DIR, "tune_04_xgboost_grid.csv"))
+xgb_results[order(-auc)]
+
+best_xgb_row <- xgb_results[order(-auc)][1]
+rm(xgb_train_sub, x_train, dtrain, x_val, dval); invisible(gc(verbose = FALSE))
+cat("Selected max_depth =", best_xgb_row$max_depth, ", eta =", best_xgb_row$eta,
+    ", best_nrounds =", best_xgb_row$best_nrounds, "\n")
+```
+
+## Final fits at the selected hyperparameters
+
+Each tuned model is refit once at its winning settings, scored on validation, and saved.
+
+```{r final-elastic}
+cat("\n=== Elastic-Net (final) ===\n")
+set.seed(20260917)
+train_sub <- stratified_sample(model_train, DEFAULT_TRAIN_CAP)
+tuned_elastic_net <- fit_glmnet_selected(train_sub, alpha = best_alpha_row$alpha)
+prob_elastic_tuned <- predict_glmnet_selected(tuned_elastic_net, validation)
+rm(train_sub); invisible(gc(verbose = FALSE))
+```
+
+```{r final-knn}
+cat("\n=== KNN (final) ===\n")
+# KNN's "model" remains the frozen training subsample + chosen k (lazy
+# learner, same documented limitation as Stage 6) -- re-using the exact
+# knn_train_sub / knn_val_idx from the grid search above, not a fresh sample.
+tuned_knn <- list(train_data = knn_train_sub, k = best_k)
+prob_knn_tuned_subset <- as.numeric(kknn::kknn(
+  as.formula(paste("y_factor ~", paste(LINEAR_PREDICTORS, collapse = " + "))),
+  train = knn_train_sub, test = knn_test_frame, k = best_k, kernel = "optimal", scale = TRUE
+)$prob[, "Yes"])
+```
+
+```{r final-rf}
+cat("\n=== Random Forest (final) ===\n")
+set.seed(20260917)
+train_sub <- stratified_sample(model_train, DEFAULT_TRAIN_CAP)
+train_sub[, y_factor := factor(isReturned, levels = c(0, 1), labels = c("No", "Yes"))]
+tuned_rf <- ranger::ranger(as.formula(paste("y_factor ~", paste(TREE_PREDICTORS, collapse = " + "))),
+                            data = train_sub, num.trees = RF_NUM_TREES, probability = TRUE,
+                            mtry = best_rf_row$mtry, min.node.size = best_rf_row$min_node_size,
+                            sample.fraction = RF_SAMPLE_FRACTION, num.threads = TREE_NUM_THREADS, seed = 20260917)
+prob_rf_tuned <- as.numeric(predict(tuned_rf, data = validation)$predictions[, "Yes"])
+rm(train_sub); invisible(gc(verbose = FALSE))
+```
+
+```{r final-xgb}
+cat("\n=== XGBoost (final) ===\n")
+set.seed(20260917)
+train_sub <- stratified_sample(model_train, DEFAULT_TRAIN_CAP)
+x_train <- build_onehot(train_sub, TREE_PREDICTORS)
+dtrain <- xgboost::xgb.DMatrix(data = x_train, label = train_sub$isReturned)
+x_val <- align_onehot(build_onehot(validation, TREE_PREDICTORS), colnames(x_train))
+dval <- xgboost::xgb.DMatrix(data = x_val, label = validation$isReturned)
+
+tuned_xgb <- xgboost::xgb.train(
+  params = list(objective = "binary:logistic", eval_metric = "logloss",
+                max_depth = best_xgb_row$max_depth, eta = best_xgb_row$eta,
+                nthread = TREE_NUM_THREADS, max_bin = HIST_MAX_BIN),
+  data = dtrain, nrounds = 500, evals = list(val = dval),
+  early_stopping_rounds = 20, verbose = 0
+)
+tuned_xgb_best_it <- xgb_best_iter(tuned_xgb)
+if (is.na(tuned_xgb_best_it)) stop("Could not read best iteration from the final xgboost fit.")
+prob_xgb_tuned <- as.numeric(predict(tuned_xgb, newdata = x_val,
+                                     iterationrange = c(1, tuned_xgb_best_it + 1)))
+cat("Final XGBoost uses", tuned_xgb_best_it, "rounds.\n")
+rm(train_sub, x_train, dtrain, dval, x_val); invisible(gc(verbose = FALSE))
+```
+
+## Save tuned models
+
+```{r save-models}
+saveRDS(tuned_elastic_net, file.path(MODEL_ZOO_TUNED_DIR, "elastic_net_logistic_tuned.rds"))
+saveRDS(tuned_knn, file.path(MODEL_ZOO_TUNED_DIR, "knn_tuned.rds"))
+saveRDS(tuned_rf, file.path(MODEL_ZOO_TUNED_DIR, "random_forest_tuned.rds"))
+# xgb.save-style serialization is the safest long-term format for boosters;
+# saveRDS also works within the same xgboost version.
+saveRDS(tuned_xgb, file.path(MODEL_ZOO_TUNED_DIR, "xgboost_tuned.rds"))
+saveRDS(tuned_xgb_best_it, file.path(MODEL_ZOO_TUNED_DIR, "xgboost_tuned_best_nrounds.rds"))
+cat("Saved 4 tuned model objects (+ XGBoost best-round count) to", MODEL_ZOO_TUNED_DIR, "\n")
+```
+
+## Baseline vs tuned
+
+```{r compare}
+tuned_metrics <- rbindlist(list(
+  compute_metrics(validation$isReturned, prob_elastic_tuned)[, `:=`(model_id = "elastic_net_logistic",
+    hyperparameters = paste0("alpha=", best_alpha_row$alpha, ", lambda=", signif(tuned_elastic_net$lambda, 4)))],
+  compute_metrics(knn_val_sub$isReturned, prob_knn_tuned_subset)[, `:=`(model_id = "knn",
+    hyperparameters = paste0("k=", best_k))],
+  compute_metrics(validation$isReturned, prob_rf_tuned)[, `:=`(model_id = "random_forest",
+    hyperparameters = paste0("mtry=", best_rf_row$mtry, ", min.node.size=", best_rf_row$min_node_size))],
+  compute_metrics(validation$isReturned, prob_xgb_tuned)[, `:=`(model_id = "xgboost",
+    hyperparameters = paste0("max_depth=", best_xgb_row$max_depth, ", eta=", best_xgb_row$eta, ", nrounds=", tuned_xgb_best_it))]
+), fill = TRUE)
+
+comparison <- merge(
+  baseline_leaderboard[model_id %in% c("elastic_net_logistic", "knn", "random_forest", "xgboost"),
+                       .(model_id, baseline_auc = auc, baseline_brier = brier)],
+  tuned_metrics[, .(model_id, tuned_auc = auc, tuned_brier = brier, hyperparameters)],
+  by = "model_id"
+)
+comparison[, `:=`(auc_delta = tuned_auc - baseline_auc, brier_delta = tuned_brier - baseline_brier)]
+setorder(comparison, -auc_delta)
+
+fwrite(comparison, file.path(TABLE_DIR, "tune_05_baseline_vs_tuned.csv"))
+comparison
+```
+
+## Quality gate
+
+```{r quality-gate}
+cat("\n============================================================\n")
+cat("STAGE 7 QUALITY GATE\n")
+cat("============================================================\n\n")
+
+GATE_PASS <- TRUE
+fail_check <- function(msg) { cat("FAIL:", msg, "\n"); GATE_PASS <<- FALSE }
+warn_check <- function(msg) cat("WARN:", msg, "\n")
+pass_check <- function(msg) cat("PASS:", msg, "\n")
+
+if (nrow(comparison) != 4) fail_check(paste("Expected 4 rows in the comparison table, found", nrow(comparison))) else pass_check("Comparison table has all 4 tuned models.")
+
+tuned_files <- list.files(MODEL_ZOO_TUNED_DIR, pattern = "_tuned\\.rds$")
+if (length(tuned_files) != 4) fail_check(paste("Expected 4 tuned .rds files, found", length(tuned_files))) else pass_check("4 tuned model files saved.")
+
+# XGBoost early-stopping bookkeeping (this is what the old log lacked)
+if (!"best_nrounds" %in% names(xgb_results) || anyNA(xgb_results$best_nrounds)) {
+  fail_check("XGBoost grid is missing best_nrounds values -- early-stopping iteration was not captured.")
+} else {
+  pass_check("XGBoost grid recorded best_nrounds for every candidate.")
+}
+if (is.na(tuned_xgb_best_it) || tuned_xgb_best_it < 1) fail_check("Final XGBoost best iteration is missing.") else pass_check("Final XGBoost best iteration captured.")
+if (any(xgb_results$best_nrounds >= 500, na.rm = TRUE)) warn_check("At least one XGBoost candidate never early-stopped (hit 500 rounds) -- consider a higher nrounds cap.")
+
+# Grid-edge warnings: the optimum sitting on the grid boundary means the grid may be too narrow
+if (best_k == max(knn_k_grid)) warn_check("KNN best k is at the top of the grid -- a larger k might do better.")
+if (best_xgb_row$eta == min(xgb_grid$eta)) warn_check("XGBoost best eta is at the bottom of the grid.")
+if (best_xgb_row$max_depth == min(xgb_grid$max_depth)) warn_check("XGBoost best max_depth is at the bottom of the grid.")
+
+worse_models <- comparison[auc_delta < -0.001, model_id]
+if (length(worse_models) > 0) {
+  warn_check(paste("Tuned AUC is (slightly) worse than baseline for:", paste(worse_models, collapse = ", "),
+                   "-- the grid may simply not include the baseline's lucky point; inspect tune_0X_*_grid.csv before Stage 8."))
+} else {
+  pass_check("Every tuned model matches or improves on its Stage 6 baseline AUC.")
+}
+
+if (!GATE_PASS) stop("Stage 7 quality gate failed -- see FAIL messages above.")
+cat("\nAll required checks passed.\n")
+```
+
+## Add tuned probabilities to the validation predictions file
+
+Stage 8 reads this file, so the tuned probabilities are appended as four new columns. KNN was only scored on the 5,000-row validation subsample, so its column is `NA` elsewhere.
+
+```{r update-predictions}
+validation_results <- fread(file.path(PROCESSED_DIR, "model_zoo_validation_predictions.csv.gz"))
+
+validation_results[, prob_elastic_net_logistic_tuned := prob_elastic_tuned]
+validation_results[, prob_random_forest_tuned := prob_rf_tuned]
+validation_results[, prob_xgboost_tuned := prob_xgb_tuned]
+validation_results[, prob_knn_tuned := NA_real_]
+validation_results[knn_val_idx, prob_knn_tuned := prob_knn_tuned_subset]
+
+fwrite(validation_results, file.path(PROCESSED_DIR, "model_zoo_validation_predictions.csv.gz"), compress = "gzip")
+message("Updated data/processed/model_zoo_validation_predictions.csv.gz with 4 tuned probability columns.")
+```
+
+## Session info
+
+```{r session-info}
+sessionInfo()
+```

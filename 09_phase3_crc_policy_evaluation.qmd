@@ -1,0 +1,759 @@
+---
+title: "CostConformal-Return — Stage 9: Phase 3 CRC Calibration and Policy Evaluation"
+subtitle: "Category-Aware and Future-Period Drift-Audited Conformal Risk Control for Value-Sensitive E-Commerce Returns"
+author: "Simran Kumari (24BDS1031)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    df-print: kable
+    theme: cosmo
+execute:
+  warning: false
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath("."))
+```
+
+# Purpose of this stage
+
+This notebook opens Phase 3 of the project and is Stage 9 of the pipeline. Stage 3 built the full CRC machinery (calibration, value-weighted CRC, category-aware CRC, subgroup audit, future-period drift audit) around a single exploratory baseline logistic regression. Phase 2 then found, selected and tuned better models (xgboost, elastic_net_logistic) through a proper 15-algorithm comparison. This stage closes the loop: it runs both Phase-2-selected models through the same CRC machinery Stage 3 established, so the project's final answer to "which model should actually run this policy" is based on value-weighted risk control, not just AUC.
+
+## Split reuse, stated explicitly
+
+`validation` was already spent on Phase 2's model selection (Stage 6-8), so it is not reused here for anything. Instead:
+
+- `crc_calibration` is used for both probability calibration (Platt vs. isotonic, selected via an internal 80/20 fit/tune slice inside it -- the same "selected, not asserted best" pattern Stage 4/6/7 already used for lambda/alpha selection) and CRC threshold selection, on the calibrated probabilities. This mirrors how Stage 3 used `crc_calibration` for threshold selection; the only change is that calibration now also happens here instead of on `validation`, because `validation` is no longer a clean, unused split.
+- `iid_holdout` is touched for the first time only at the evaluation step -- genuinely held out from model fitting, model selection, calibration, and threshold selection alike.
+- `future_test` is used only for the drift audit, exactly as in Stage 3.
+
+## A real xgboost serialization gotcha, handled explicitly
+
+`saveRDS()` on an `xgb.Booster` object is a known fragile pattern across R sessions (the Booster holds an external C++ pointer). This is precisely why Stage 8 additionally saved `xgboost_tuned.ubj` via `xgb.save()`. This stage tries the plain `.rds` first (cheap: predicts on a few rows), and if that fails, reloads the actual booster from the `.ubj` file via `xgb.load()` while keeping the `predictors`/`train_colnames` metadata from the `.rds` wrapper -- the `.ubj` file alone does not carry that metadata, only the `.rds` wrapper does.
+
+## A second gotcha: input-matrix alignment on aarch64
+
+On this machine (aarch64, R 4.6), every way of feeding data into xgboost failed: `predict(newdata = <matrix>)` and `xgb.DMatrix(<matrix>)` hit `Check failed: ptr % alignment == 0 (Input pointer misalignment)` even for a freshly allocated matrix, and the text-file route is both deprecated (xgboost 3.1) and failed in its CSV parser. Loading the booster from `.ubj` and dumping its trees does work, so this stage:
+
+- loads the booster from `xgboost_tuned.ubj` only (the `.rds` Booster is never used),
+- extracts the trees once with `xgb.model.dt.tree()`, takes the feature names from the booster itself and builds the design matrix directly from them (the RDS wrapper's `predictors`/`train_colnames` did not match the booster), and reads the intercept (`base_score`) from the booster config,
+- scores the trees directly in R (`xgb_predict_trees()`), in row chunks, so xgboost never has to ingest an input matrix,
+- prints a sanity line per model (mean predicted vs. observed return rate, AUC) so a scorer error would be visible immediately.
+
+## Memory profile (6 GB RAM, same discipline as Stages 4-8)
+
+`future_test` is 1.46M rows -- by far the largest split in the project. It is loaded once, both models are scored on it in sequence (not simultaneously), drift metrics are computed, and it is freed before anything else runs. `crc_calibration` (\~137k rows) and `iid_holdout` (\~137k rows) are each loaded only for the chunks that need them and freed afterward.
+
+## Before you render this document
+
+1.  Save this file as `09_phase3_crc_policy_evaluation.qmd` in the project root.
+2.  Confirm Stage 8's checklist is fully green -- `models/r_final_model_registry.rds` must exist and list `xgboost` and `elastic_net_logistic` as `selected = TRUE`.
+3.  Needs `glmnet`, `xgboost`, `DBI`, `RSQLite` (already installed in earlier stages).
+4.  Render with Ctrl/Cmd+Shift+K, or run chunk-by-chunk. This stage touches `future_test` (1.46M rows), so expect it to take a while on the drift-audit chunks.
+
+# Setup
+
+```{r source-setup}
+source(file.path("R", "00_setup.R"))
+data.table::setDTthreads(2)
+
+required_packages <- c("DBI", "RSQLite", "glmnet", "xgboost")
+missing_packages <- setdiff(required_packages, rownames(installed.packages()))
+if (length(missing_packages) > 0) install.packages(missing_packages)
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+ALPHA_GRID <- c(0.01, 0.025, 0.05, 0.075, 0.10)      # same grid as Stage 3, for direct comparability
+MIN_CATEGORY_SUPPORT <- 500                           # same category-aware CRC support rule as Stage 3
+CATEGORY_ALPHA <- 0.05                                # the alpha Stage 3 reported category-level detail for
+PRED_CHUNK_SIZE <- 50000                              # rows per prediction chunk (memory + alignment safety)
+
+P3_DIR <- file.path(MODEL_DIR, "phase3_crc")
+dir.create(P3_DIR, showWarnings = FALSE, recursive = TRUE)
+
+DB_PATH <- file.path("data", "costconformal_return.sqlite")
+if (!file.exists(DB_PATH)) stop("Stage 5's database not found at ", DB_PATH, " -- run earlier stages first.")
+```
+
+```{r load-metadata-and-registry}
+preprocessor <- readRDS(file.path(MODEL_DIR, "r_preprocessor.rds"))
+feature_selector <- readRDS(file.path(MODEL_DIR, "r_feature_selector.rds"))
+registry <- readRDS(file.path(MODEL_DIR, "r_final_model_registry.rds"))
+
+selected_ids <- sapply(registry$models, function(m) if (isTRUE(m$selected)) m$model_id else NA_character_)
+selected_ids <- selected_ids[!is.na(selected_ids)]
+cat("Selected models from Stage 8 registry:", paste(selected_ids, collapse = ", "), "\n")
+stopifnot(all(c("xgboost", "elastic_net_logistic") %in% selected_ids))
+
+bin_label_levels <- function(fs) {
+  bd <- fs$bin_definitions
+  list(
+    price_tier = c("Q1_low", "Q2", "Q3", "Q4_high")[seq_len(length(bd$price_breaks) - 1)],
+    customer_risk_tier = c("Low", "Mid", "High")[seq_len(length(bd$risk_breaks) - 1)]
+  )
+}
+BIN_LEVELS <- bin_label_levels(feature_selector)
+
+load_split_from_db <- function(con, split_name, preprocessor, feature_selector, bin_levels) {
+  dt <- as.data.table(DBI::dbGetQuery(con, paste0("SELECT * FROM ", split_name)))
+  for (col in feature_selector$categorical_features) {
+    if (col %in% names(dt)) {
+      levs <- union(preprocessor$allowed_levels[[col]], "OTHER")
+      set(dt, j = col, value = factor(dt[[col]], levels = levs))
+    }
+  }
+  for (col in names(bin_levels)) {
+    if (col %in% names(dt)) set(dt, j = col, value = factor(dt[[col]], levels = bin_levels[[col]]))
+  }
+  dt
+}
+```
+
+## Matrix helpers (alignment-safe)
+
+```{r matrix-helpers}
+build_onehot <- function(dt, predictors) {
+  model.matrix(as.formula(paste("~", paste(predictors, collapse = " + "), "- 1")), data = dt)
+}
+
+# Pads any training columns missing from x with zeros and reorders to the
+# training column order. Always returns a plain matrix (never a data.frame).
+align_onehot <- function(x, train_colnames) {
+  x <- as.matrix(x)
+  missing_cols <- setdiff(train_colnames, colnames(x))
+  if (length(missing_cols) > 0) {
+    add <- matrix(0, nrow = nrow(x), ncol = length(missing_cols),
+                  dimnames = list(NULL, missing_cols))
+    x <- cbind(x, add)
+  }
+  x[, train_colnames, drop = FALSE]
+}
+
+# ---- Pure-R scoring of an xgboost booster -------------------------------------
+# xgboost's own data ingestion (array interface, DMatrix, text files) is broken
+# or deprecated on this install, but loading the .ubj booster and dumping its
+# trees works. So the trees are read out once and scored directly in R.
+
+# Reads the trees into per-tree vectors (0-based node ids, feature index 0 = leaf).
+# Feature names come from the BOOSTER's own split features, so scoring does not
+# depend on the train_colnames stored in the RDS wrapper (which can differ).
+# Only if the booster is unnamed (f0, f1, ...) are positions mapped through
+# wrapper_colnames.
+xgb_extract_trees <- function(booster, wrapper_colnames = NULL) {
+  dt <- as.data.table(xgboost::xgb.model.dt.tree(model = booster))
+  leaf_col <- if ("Gain" %in% names(dt)) "Gain" else "Quality"   # leaf value lives here
+  feat_chr <- as.character(dt$Feature)
+  split_feats <- unique(feat_chr[feat_chr != "Leaf"])
+
+  unnamed <- all(grepl("^f[0-9]+$", split_feats)) &&
+    !is.null(wrapper_colnames) && !all(split_feats %in% wrapper_colnames)
+  if (unnamed) {
+    feat_names <- wrapper_colnames
+    fidx <- as.integer(sub("^f", "", feat_chr)) + 1L
+  } else {
+    feat_names <- split_feats
+    fidx <- match(feat_chr, feat_names)
+  }
+  fidx[feat_chr == "Leaf"] <- 0L
+
+  trees <- lapply(split(seq_len(nrow(dt)), dt$Tree), function(rows) {
+    d <- dt[rows]; fi <- fidx[rows]
+    o <- order(d$Node); d <- d[o]; fi <- fi[o]
+    stopifnot(identical(as.integer(d$Node), seq_len(nrow(d)) - 1L))
+    list(feat  = as.integer(fi),
+         split = as.numeric(d$Split),
+         yes   = match(d$Yes, d$ID) - 1L,
+         no    = match(d$No,  d$ID) - 1L,
+         value = as.numeric(d[[leaf_col]]))
+  })
+  list(trees = trees, feat_names = feat_names)
+}
+
+# Global intercept on the margin (logit) scale, from the booster's own config.
+xgb_base_margin <- function(booster) {
+  bs <- tryCatch({
+    cfg <- xgboost::xgb.config(booster)
+    v <- NULL
+    if (is.list(cfg)) v <- cfg$learner$learner_model_param$base_score
+    if (is.null(v) && is.character(cfg))
+      v <- sub('.*"base_score"\\s*:\\s*"([^"]+)".*', "\\1", cfg)
+    as.numeric(gsub("[][]", "", v))[1]
+  }, error = function(e) NA_real_)
+  if (is.na(bs)) {
+    warning("Could not read base_score from the booster config; assuming 0.5.")
+    bs <- 0.5
+  }
+  qlogis(bs)
+}
+
+# Scores a plain numeric matrix (columns already in train_colnames order).
+# Splits are "go to Yes branch if value < Split", as in xgboost.
+xgb_predict_trees <- function(fit, x) {
+  if (anyNA(x)) stop("NA in model matrix; tree scorer does not handle missing values.")
+  n <- nrow(x)
+  margin <- rep(fit$base_margin, n)
+  for (tr in fit$trees) {
+    pos <- rep.int(0L, n)
+    repeat {
+      f <- tr$feat[pos + 1L]
+      act <- which(f > 0L)
+      if (length(act) == 0L) break
+      xv <- x[cbind(act, f[act])]
+      p <- pos[act] + 1L
+      pos[act] <- ifelse(xv < tr$split[p], tr$yes[p], tr$no[p])
+    }
+    margin <- margin + tr$value[pos + 1L]
+  }
+  plogis(margin)
+}
+
+# Rank-based AUC, for a quick sanity check of the scorer.
+rank_auc <- function(y, p) {
+  r <- rank(p); n1 <- sum(y == 1); n0 <- sum(y == 0)
+  (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+# ---- Design matrix built from the booster's OWN feature names ------------------
+# Each feature name is either a column of the data (numeric/logical: used as is)
+# or "<variable><level>" (the model.matrix naming for a one-hot dummy, e.g.
+# "shippingCountryOTHER" = variable shippingCountry, level OTHER). This needs no
+# stored `predictors` metadata, so it cannot disagree with the booster.
+resolve_design_spec <- function(dt, feat_names) {
+  vars <- names(dt)
+  spec <- lapply(feat_names, function(f) {
+    if (f %in% vars && (is.numeric(dt[[f]]) || is.logical(dt[[f]])))
+      return(list(name = f, var = f, level = NULL))
+    cand <- vars[startsWith(f, vars) & nchar(f) > nchar(vars)]
+    if (length(cand) == 0) return(list(name = f, var = NA_character_, level = NULL))
+    v <- cand[which.max(nchar(cand))]
+    list(name = f, var = v, level = substring(f, nchar(v) + 1L))
+  })
+  unresolved <- feat_names[vapply(spec, function(z) is.na(z$var), logical(1))]
+  if (length(unresolved) > 0) {
+    stop(length(unresolved), " booster feature(s) cannot be built from the data columns: ",
+         paste(head(unresolved, 8), collapse = ", "))
+  }
+  spec
+}
+
+build_design <- function(dt, spec) {
+  x <- matrix(0, nrow = nrow(dt), ncol = length(spec),
+              dimnames = list(NULL, vapply(spec, function(z) z$name, character(1))))
+  for (j in seq_along(spec)) {
+    z <- spec[[j]]
+    col <- dt[[z$var]]
+    x[, j] <- if (is.null(z$level)) as.numeric(col) else as.numeric(as.character(col) %in% z$level)
+  }
+  x
+}
+
+```
+
+# Loading the two selected models, robustly
+
+```{r load-selected-models}
+load_xgb_robust <- function(entry) {
+
+  # Metadata from the RDS wrapper. Its Booster is NOT used: an external pointer
+  # saved with saveRDS() is stale across R sessions.
+  wrapper <- readRDS(entry$model_path)
+  predictors <- wrapper$predictors
+  wrapper_colnames <- wrapper$train_colnames
+  rm(wrapper)
+
+  # The booster itself comes from the stable .ubj serialization.
+  booster <- xgboost::xgb.load(entry$xgb_ubj_path)
+  ex <- xgb_extract_trees(booster, wrapper_colnames)
+  base_margin <- xgb_base_margin(booster)
+
+  cat("xgboost booster loaded from .ubj: ", length(ex$trees), " trees, ",
+      length(ex$feat_names), " split features, base_score = ",
+      round(plogis(base_margin), 5), ".\n", sep = "")
+  cat("Booster features (first 6): ", paste(head(ex$feat_names, 6), collapse = ", "), "\n", sep = "")
+  cat("RDS wrapper predictors (", length(predictors), "; first 6): ",
+      paste(head(predictors, 6), collapse = ", "), "\n", sep = "")
+  cat("RDS wrapper train_colnames (", length(wrapper_colnames), "; first 6): ",
+      paste(head(wrapper_colnames, 6), collapse = ", "), "\n", sep = "")
+  n_overlap <- length(intersect(ex$feat_names, wrapper_colnames))
+  if (n_overlap < length(ex$feat_names)) {
+    cat("NOTE: ", length(ex$feat_names) - n_overlap, " of ", length(ex$feat_names),
+        " booster features are not in the RDS wrapper's train_colnames. ",
+        "The design matrix is therefore built from the booster's own feature names.\n", sep = "")
+  }
+
+  list(model = booster, trees = ex$trees, base_margin = base_margin,
+       predictors = predictors, train_colnames = ex$feat_names)
+}
+
+# Chunked over ROWS of newdata. The design matrix is built directly from the
+# booster's feature names (see resolve_design_spec), and the function stops with
+# a clear message if any feature cannot be built from the data.
+predict_xgboost <- function(fit, newdata, chunk_size = PRED_CHUNK_SIZE) {
+  n <- nrow(newdata)
+  spec <- resolve_design_spec(newdata, fit$train_colnames)
+  out <- numeric(n)
+  for (s in seq(1, n, by = chunk_size)) {
+    e <- min(s + chunk_size - 1, n)
+    out[s:e] <- xgb_predict_trees(fit, build_design(newdata[s:e], spec))
+  }
+  out
+}
+
+predict_glmnet_selected <- function(fit, newdata, chunk_size = PRED_CHUNK_SIZE) {
+  n <- nrow(newdata)
+  out <- numeric(n)
+  for (s in seq(1, n, by = chunk_size)) {
+    e <- min(s + chunk_size - 1, n)
+    x <- align_onehot(build_onehot(newdata[s:e], fit$predictors), fit$train_colnames)
+    out[s:e] <- as.numeric(predict(fit$model, newx = x, s = fit$lambda, type = "response"))
+  }
+  out
+}
+
+registry_by_id <- setNames(registry$models, sapply(registry$models, `[[`, "model_id"))
+
+# Load XGBoost.
+xgb_fit <- load_xgb_robust(registry_by_id$xgboost)
+
+# Load Elastic-Net.
+en_fit <- readRDS(registry_by_id$elastic_net_logistic$model_path)
+
+# This object must be created before fit-calibrators runs.
+SELECTED_MODELS <- list(
+  xgboost = list(label = "XGBoost", fit = xgb_fit, predict_fn = predict_xgboost),
+  elastic_net_logistic = list(label = "Elastic-Net", fit = en_fit, predict_fn = predict_glmnet_selected)
+)
+
+cat("Selected models loaded successfully: ", paste(names(SELECTED_MODELS), collapse = ", "), "\n", sep = "")
+```
+
+# Calibration helpers
+
+Same two-method comparison as Stage 3 (raw vs. Platt vs. isotonic), re-implemented here since `00_setup.R` does not carry stage-specific calibration code. An internal 80/20 fit/tune split of `crc_calibration` decides the method by validation-style Brier score; the winner is refit on the full split.
+
+```{r calibration-helpers}
+fit_platt <- function(raw_prob, y) {
+  logit_p <- qlogis(pmin(pmax(raw_prob, 1e-6), 1 - 1e-6))
+  glm(y ~ logit_p, family = binomial(), data = data.frame(y = y, logit_p = logit_p))
+}
+predict_platt <- function(platt_model, raw_prob) {
+  logit_p <- qlogis(pmin(pmax(raw_prob, 1e-6), 1 - 1e-6))
+  as.numeric(predict(platt_model, newdata = data.frame(logit_p = logit_p), type = "response"))
+}
+
+fit_isotonic <- function(raw_prob, y) as.stepfun(isoreg(x = raw_prob, y = y))
+predict_isotonic <- function(iso_step, raw_prob) pmin(pmax(iso_step(raw_prob), 0), 1)
+
+# Fits + selects a calibrator for one model's raw probabilities on
+# crc_calibration, via an internal fit/tune split so the selection itself
+# isn't evaluated on the exact rows it was chosen from.
+select_calibrator <- function(raw_prob, y) {
+  n <- length(y)
+  set.seed(20260917)
+  tune_idx <- sample.int(n, size = round(0.2 * n))
+  fit_idx <- setdiff(seq_len(n), tune_idx)
+
+  platt_fit <- fit_platt(raw_prob[fit_idx], y[fit_idx])
+  iso_fit <- fit_isotonic(raw_prob[fit_idx], y[fit_idx])
+
+  brier_platt <- brier_score(y[tune_idx], predict_platt(platt_fit, raw_prob[tune_idx]))
+  brier_iso <- brier_score(y[tune_idx], predict_isotonic(iso_fit, raw_prob[tune_idx]))
+  brier_raw <- brier_score(y[tune_idx], raw_prob[tune_idx])
+
+  comparison <- data.table(method = c("raw", "platt", "isotonic"), brier = c(brier_raw, brier_platt, brier_iso))
+  best_method <- comparison[order(brier)][1, method]
+
+  # Refit the winner on the FULL crc_calibration split (not just fit_idx).
+  final <- switch(best_method,
+    raw = list(method = "raw", predict_fn = function(p) p),
+    platt = { pf <- fit_platt(raw_prob, y); list(method = "platt", model = pf, predict_fn = function(p) predict_platt(pf, p)) },
+    isotonic = { isf <- fit_isotonic(raw_prob, y); list(method = "isotonic", step = isf, predict_fn = function(p) predict_isotonic(isf, p)) }
+  )
+  list(comparison = comparison, calibrator = final)
+}
+```
+
+# CRC and drift-audit helpers
+
+Same formulas as Stage 3: the finite-sample-corrected risk rule from Angelopoulos et al. (2024), the category-aware extension with the same minimum-support rule, and the same PSI/KS/JS drift diagnostics.
+
+```{r crc-helpers}
+crc_select_threshold <- function(y, v, p_hat, alpha, n_grid = 200) {
+  taus <- sort(unique(c(0, quantile(p_hat, probs = seq(0, 1, length.out = n_grid), names = FALSE), 1)))
+  n <- length(y)
+  risks <- sapply(taus, function(tau) mean(y * v * (p_hat < tau)))
+  corrected <- (n / (n + 1)) * risks + 1 / (n + 1)
+  feasible <- which(corrected < alpha)
+  if (length(feasible) == 0) {
+    return(list(tau = max(taus), risk = risks[length(risks)], corrected_risk = corrected[length(corrected)], feasible = FALSE))
+  }
+  best_idx <- feasible[which.max(taus[feasible])]
+  list(tau = taus[best_idx], risk = risks[best_idx], corrected_risk = corrected[best_idx], feasible = TRUE)
+}
+
+policy_risk <- function(y, v, p_hat, tau) mean(y * v * (p_hat < tau))
+intervention_rate <- function(p_hat, tau) mean(p_hat >= tau)
+
+psi <- function(expected, actual, n_bins = 10) {
+  breaks <- unique(quantile(expected, probs = seq(0, 1, length.out = n_bins + 1), na.rm = TRUE))
+  if (length(breaks) < 3) return(NA_real_)
+  e_counts <- table(cut(expected, breaks, include.lowest = TRUE))
+  a_counts <- table(cut(actual, breaks, include.lowest = TRUE))
+  e_pct <- pmax(e_counts / sum(e_counts), 1e-6)
+  a_pct <- pmax(a_counts / sum(a_counts), 1e-6)
+  sum((a_pct - e_pct) * log(a_pct / e_pct))
+}
+ks_two_sample <- function(x, y) {
+  x <- x[is.finite(x)]; y <- y[is.finite(y)]
+  if (length(x) == 0 || length(y) == 0) return(NA_real_)
+  suppressWarnings(as.numeric(ks.test(x, y)$statistic))
+}
+js_divergence <- function(expected, actual, n_bins = 10) {
+  breaks <- unique(quantile(c(expected, actual), probs = seq(0, 1, length.out = n_bins + 1), na.rm = TRUE))
+  if (length(breaks) < 3) return(NA_real_)
+  e_pct <- pmax(table(cut(expected, breaks, include.lowest = TRUE)) / length(expected), 1e-6)
+  a_pct <- pmax(table(cut(actual, breaks, include.lowest = TRUE)) / length(actual), 1e-6)
+  m_pct <- 0.5 * (e_pct + a_pct)
+  0.5 * sum(e_pct * log(e_pct / m_pct)) + 0.5 * sum(a_pct * log(a_pct / m_pct))
+}
+```
+
+# Fit calibrators on crc_calibration
+
+```{r fit-calibrators}
+con <- DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
+crc_calibration <- load_split_from_db(con, "crc_calibration", preprocessor, feature_selector, BIN_LEVELS)
+DBI::dbDisconnect(con)
+cat("crc_calibration:", nrow(crc_calibration), "rows.\n")
+
+calibration_results <- list()
+calibrators <- list()
+
+for (id in names(SELECTED_MODELS)) {
+  m <- SELECTED_MODELS[[id]]
+  raw_prob <- m$predict_fn(m$fit, crc_calibration)
+  cat(id, "-- sanity: mean predicted =", round(mean(raw_prob), 4),
+      "| observed return rate =", round(mean(crc_calibration$isReturned), 4),
+      "| AUC =", round(rank_auc(crc_calibration$isReturned, raw_prob), 4), "\n")
+  sel <- select_calibrator(raw_prob, crc_calibration$isReturned)
+  sel$comparison[, model_id := id]
+  calibration_results[[id]] <- sel$comparison
+  calibrators[[id]] <- sel$calibrator
+  cat(id, "-- selected calibration method:", sel$calibrator$method, "\n")
+}
+
+calibration_comparison <- rbindlist(calibration_results)
+fwrite(calibration_comparison, file.path(TABLE_DIR, "p3_01_calibration_comparison.csv"))
+calibration_comparison
+```
+
+# Global CRC threshold selection (on crc_calibration)
+
+```{r global-crc}
+global_crc_results <- rbindlist(lapply(names(SELECTED_MODELS), function(id) {
+  m <- SELECTED_MODELS[[id]]
+  raw_prob <- m$predict_fn(m$fit, crc_calibration)
+  calibrated_prob <- calibrators[[id]]$predict_fn(raw_prob)
+
+  rbindlist(lapply(ALPHA_GRID, function(a) {
+    sel <- crc_select_threshold(crc_calibration$isReturned, crc_calibration$value_exposure, calibrated_prob, a)
+    data.table(model_id = id, alpha = a, tau = sel$tau, calibration_risk = sel$risk,
+               calibration_corrected_risk = sel$corrected_risk,
+               calibration_intervention_rate = intervention_rate(calibrated_prob, sel$tau),
+               feasible = sel$feasible)
+  }))
+}))
+
+fwrite(global_crc_results, file.path(TABLE_DIR, "p3_02_global_crc_thresholds.csv"))
+global_crc_results
+```
+
+# Category-aware CRC (alpha = `r CATEGORY_ALPHA`, on crc_calibration)
+
+```{r category-crc}
+category_crc_results <- rbindlist(lapply(names(SELECTED_MODELS), function(id) {
+  m <- SELECTED_MODELS[[id]]
+  raw_prob <- m$predict_fn(m$fit, crc_calibration)
+  calibrated_prob <- calibrators[[id]]$predict_fn(raw_prob)
+
+  global_tau <- global_crc_results[model_id == id & alpha == CATEGORY_ALPHA, tau]
+  categories <- unique(as.character(crc_calibration[!is.na(productType), productType]))
+
+  rbindlist(lapply(categories, function(cat_val) {
+    idx <- which(as.character(crc_calibration$productType) == cat_val)
+    n_sub <- length(idx)
+    if (n_sub < MIN_CATEGORY_SUPPORT) {
+      return(data.table(model_id = id, productType = cat_val, n_calibration = n_sub,
+                         tau = global_tau, used_global_fallback = TRUE))
+    }
+    sel <- crc_select_threshold(crc_calibration$isReturned[idx], crc_calibration$value_exposure[idx],
+                                 calibrated_prob[idx], CATEGORY_ALPHA)
+    data.table(model_id = id, productType = cat_val, n_calibration = n_sub,
+               tau = sel$tau, used_global_fallback = FALSE)
+  }))
+}))
+
+fwrite(category_crc_results, file.path(TABLE_DIR, "p3_03_category_crc_thresholds.csv"))
+category_crc_results
+```
+
+# Evaluation on iid_holdout (genuinely held out)
+
+```{r evaluate-holdout}
+con <- DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
+iid_holdout <- load_split_from_db(con, "iid_holdout", preprocessor, feature_selector, BIN_LEVELS)
+DBI::dbDisconnect(con)
+cat("iid_holdout:", nrow(iid_holdout), "rows.\n")
+
+holdout_results <- rbindlist(lapply(names(SELECTED_MODELS), function(id) {
+  m <- SELECTED_MODELS[[id]]
+  raw_prob <- m$predict_fn(m$fit, iid_holdout)
+  calibrated_prob <- calibrators[[id]]$predict_fn(raw_prob)
+
+  rbindlist(lapply(ALPHA_GRID, function(a) {
+    tau <- global_crc_results[model_id == id & alpha == a, tau]
+    risk <- policy_risk(iid_holdout$isReturned, iid_holdout$value_exposure, calibrated_prob, tau)
+    data.table(model_id = id, alpha = a, tau = tau, holdout_risk = risk,
+               holdout_intervention_rate = intervention_rate(calibrated_prob, tau),
+               risk_target_met_on_holdout = risk < a)
+  }))
+}))
+
+fwrite(holdout_results, file.path(TABLE_DIR, "p3_04_holdout_evaluation.csv"))
+holdout_results
+```
+
+# Subgroup / intervention-burden audit (diagnostic only, iid_holdout, alpha = `r CATEGORY_ALPHA`)
+
+```{r subgroup-audit}
+subgroup_vars <- c("age_band", "shippingCountry", "isMale", "premier")
+
+subgroup_audit <- rbindlist(lapply(names(SELECTED_MODELS), function(id) {
+  m <- SELECTED_MODELS[[id]]
+  raw_prob <- m$predict_fn(m$fit, iid_holdout)
+  calibrated_prob <- calibrators[[id]]$predict_fn(raw_prob)
+  tau <- global_crc_results[model_id == id & alpha == CATEGORY_ALPHA, tau]
+
+  rbindlist(lapply(subgroup_vars, function(var) {
+    vals <- unique(as.character(iid_holdout[[var]]))
+    rbindlist(lapply(vals, function(v) {
+      idx <- which(as.character(iid_holdout[[var]]) == v)
+      data.table(
+        model_id = id, subgroup_variable = var, subgroup_value = v, n = length(idx),
+        intervention_rate = intervention_rate(calibrated_prob[idx], tau),
+        false_negative_exposure = mean(iid_holdout$isReturned[idx] * iid_holdout$value_exposure[idx] * (calibrated_prob[idx] < tau))
+      )
+    }))
+  }))
+}))
+
+burden_gaps <- subgroup_audit[, .(
+  intervention_rate_gap = max(intervention_rate) - min(intervention_rate),
+  false_negative_exposure_gap = max(false_negative_exposure) - min(false_negative_exposure),
+  highest_missed_exposure_group = subgroup_value[which.max(false_negative_exposure)]
+), by = .(model_id, subgroup_variable)]
+
+fwrite(subgroup_audit, file.path(TABLE_DIR, "p3_05_subgroup_audit.csv"))
+fwrite(burden_gaps, file.path(TABLE_DIR, "p3_06_subgroup_burden_gaps.csv"))
+burden_gaps
+
+rm(iid_holdout); invisible(gc(verbose = FALSE))
+```
+
+# Future-period drift audit (official_future_test)
+
+Loaded once, both models scored in sequence, freed immediately after -- this is the single largest split in the project (1.46M rows).
+
+```{r drift-audit}
+con <- DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
+future_test <- load_split_from_db(con, "future_test", preprocessor, feature_selector, BIN_LEVELS)
+DBI::dbDisconnect(con)
+cat("future_test:", nrow(future_test), "rows.\n")
+
+drift_vars <- c("avgGbpPrice", "customerReturnRate", "productReturnRate", "discount_ratio")
+drift_vars <- intersect(drift_vars, names(future_test))  # only ones Stage 4 kept in the feature set
+
+drift_results <- list()
+future_risk_results <- list()
+
+for (id in names(SELECTED_MODELS)) {
+  m <- SELECTED_MODELS[[id]]
+
+  raw_prob_calib <- m$predict_fn(m$fit, crc_calibration)
+  calibrated_prob_calib <- calibrators[[id]]$predict_fn(raw_prob_calib)
+
+  raw_prob_future <- m$predict_fn(m$fit, future_test)
+  calibrated_prob_future <- calibrators[[id]]$predict_fn(raw_prob_future)
+
+  var_drift <- rbindlist(lapply(drift_vars, function(v) {
+    data.table(model_id = id, variable = v,
+               psi = psi(crc_calibration[[v]], future_test[[v]]),
+               ks_statistic = ks_two_sample(crc_calibration[[v]], future_test[[v]]),
+               js_divergence = js_divergence(crc_calibration[[v]], future_test[[v]]))
+  }))
+  prob_drift <- data.table(model_id = id, variable = "calibrated_prob",
+                            psi = psi(calibrated_prob_calib, calibrated_prob_future),
+                            ks_statistic = ks_two_sample(calibrated_prob_calib, calibrated_prob_future),
+                            js_divergence = js_divergence(calibrated_prob_calib, calibrated_prob_future))
+  drift_results[[id]] <- rbindlist(list(var_drift, prob_drift))
+  drift_results[[id]][, psi_flag := psi > 0.25]  # operational review trigger, not a theorem -- same as Stage 3
+
+  calib_brier <- brier_score(crc_calibration$isReturned, calibrated_prob_calib)
+  future_brier <- brier_score(future_test$isReturned, calibrated_prob_future)
+
+  future_alpha_risk <- rbindlist(lapply(ALPHA_GRID, function(a) {
+    tau <- global_crc_results[model_id == id & alpha == a, tau]
+    risk <- policy_risk(future_test$isReturned, future_test$value_exposure, calibrated_prob_future, tau)
+    data.table(model_id = id, alpha = a, tau = tau, future_test_risk = risk,
+               future_test_intervention_rate = intervention_rate(calibrated_prob_future, tau),
+               risk_target_met_on_future_test = risk < a)
+  }))
+  future_alpha_risk[, `:=`(reference_brier = calib_brier, future_brier = future_brier,
+                            brier_change = future_brier - calib_brier)]
+  future_risk_results[[id]] <- future_alpha_risk
+
+  rm(raw_prob_calib, calibrated_prob_calib, raw_prob_future, calibrated_prob_future)
+  invisible(gc(verbose = FALSE))
+}
+
+drift_summary <- rbindlist(drift_results)
+future_evaluation <- rbindlist(future_risk_results)
+
+fwrite(drift_summary, file.path(TABLE_DIR, "p3_07_drift_summary.csv"))
+fwrite(future_evaluation, file.path(TABLE_DIR, "p3_08_future_test_evaluation.csv"))
+
+drift_summary
+future_evaluation
+
+rm(future_test); invisible(gc(verbose = FALSE))
+```
+
+# Recalibration alert
+
+Rule fixed in advance, same as Stage 3: flag if PSI exceeds 0.25 or the risk target is missed on `future_test`, for either model.
+
+```{r recalibration-alert}
+recalibration_alert <- rbindlist(lapply(names(SELECTED_MODELS), function(id) {
+  data.table(
+    model_id = id,
+    psi_flag_triggered = any(drift_summary[model_id == id, psi_flag], na.rm = TRUE),
+    risk_target_missed_on_future_test = any(!future_evaluation[model_id == id, risk_target_met_on_future_test])
+  )
+}))
+recalibration_alert[, recalibration_recommended := psi_flag_triggered | risk_target_missed_on_future_test]
+
+fwrite(recalibration_alert, file.path(TABLE_DIR, "p3_09_recalibration_alert.csv"))
+recalibration_alert
+```
+
+# Final comparison: XGBoost vs. Elastic-Net, on the actual decision policy
+
+This is the comparison Phase 3 is really asking for -- not AUC, but value-weighted CRC risk and intervention workload, head-to-head, at every alpha.
+
+```{r final-policy-comparison}
+policy_comparison <- merge(
+  global_crc_results[, .(model_id, alpha, tau, calibration_intervention_rate)],
+  holdout_results[, .(model_id, alpha, holdout_risk, holdout_intervention_rate, risk_target_met_on_holdout)],
+  by = c("model_id", "alpha")
+)
+policy_comparison <- merge(policy_comparison,
+  future_evaluation[, .(model_id, alpha, future_test_risk, future_test_intervention_rate, risk_target_met_on_future_test)],
+  by = c("model_id", "alpha"))
+setorder(policy_comparison, alpha, model_id)
+
+fwrite(policy_comparison, file.path(TABLE_DIR, "p3_10_final_policy_comparison.csv"))
+knitr::kable(policy_comparison, digits = 5)
+```
+
+```{r fig-policy-comparison}
+#| fig-width: 8
+#| fig-height: 5
+plot_dt <- merge(policy_comparison, data.table(model_id = names(SELECTED_MODELS),
+                                               label = sapply(SELECTED_MODELS, `[[`, "label")), by = "model_id")
+p_policy <- ggplot(plot_dt, aes(x = factor(alpha), y = holdout_intervention_rate, fill = label)) +
+  geom_col(position = "dodge") +
+  labs(title = "Intervention workload on iid_holdout, by alpha and model",
+       x = "Target risk level (alpha)", y = "Intervention rate", fill = NULL) +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+ggsave(file.path(FIGURE_DIR, "p3_policy_intervention_comparison.png"), p_policy, width = 8, height = 5, dpi = 200)
+p_policy
+```
+
+# Saving calibrators and the Phase 3 registry
+
+```{r save-outputs}
+saveRDS(calibrators, file.path(P3_DIR, "r_calibrators.rds"))
+
+phase3_registry <- list(
+  created = Sys.time(),
+  alpha_grid = ALPHA_GRID,
+  category_alpha = CATEGORY_ALPHA,
+  min_category_support = MIN_CATEGORY_SUPPORT,
+  calibration_methods = sapply(calibrators, `[[`, "method"),
+  recalibration_alert = recalibration_alert
+)
+saveRDS(phase3_registry, file.path(MODEL_DIR, "r_phase3_registry.rds"))
+message("Saved calibrators and Phase 3 registry.")
+```
+
+# Quality gate
+
+```{r quality-gate}
+cat("\n============================================================\nSTAGE 9 QUALITY GATE\n",
+    "============================================================\n\n", sep = "")
+GATE_PASS <- TRUE
+fail_check <- function(msg) { cat("FAIL:", msg, "\n"); GATE_PASS <<- FALSE }
+warn_check <- function(msg) cat("WARN:", msg, "\n")
+pass_check <- function(msg) cat("PASS:", msg, "\n")
+
+p3_tables <- paste0("p3_0", 1:9, c("_calibration_comparison", "_global_crc_thresholds", "_category_crc_thresholds",
+                                    "_holdout_evaluation", "_subgroup_audit", "_subgroup_burden_gaps",
+                                    "_drift_summary", "_future_test_evaluation", "_recalibration_alert"))
+p3_tables <- c(p3_tables, "p3_10_final_policy_comparison")
+if (all(file.exists(file.path(TABLE_DIR, paste0(p3_tables, ".csv"))))) pass_check("All 10 Phase 3 tables written.") else fail_check("A Phase 3 table is missing.")
+
+if (nrow(global_crc_results) == length(SELECTED_MODELS) * length(ALPHA_GRID)) pass_check("Global CRC thresholds computed for both models, all alphas.") else fail_check("Global CRC threshold table is incomplete.")
+if (all(global_crc_results$feasible)) pass_check("Every alpha had a feasible CRC threshold on crc_calibration.") else warn_check("At least one alpha had no feasible threshold on crc_calibration -- check p3_02 before trusting its holdout/future numbers.")
+
+if (all(holdout_results$risk_target_met_on_holdout)) {
+  pass_check("Risk target met on iid_holdout for every alpha, both models.")
+} else {
+  warn_check(paste("Risk target missed on iid_holdout for:",
+                    paste(holdout_results[risk_target_met_on_holdout == FALSE, paste(model_id, "alpha =", alpha)], collapse = "; ")))
+}
+
+if (any(recalibration_alert$recalibration_recommended)) {
+  warn_check(paste("Recalibration recommended for:", paste(recalibration_alert[recalibration_recommended == TRUE, model_id], collapse = ", ")))
+} else {
+  pass_check("No recalibration flagged for either model.")
+}
+
+if (file.exists(file.path(P3_DIR, "r_calibrators.rds")) && file.exists(file.path(MODEL_DIR, "r_phase3_registry.rds"))) {
+  pass_check("Calibrators and Phase 3 registry saved.")
+} else {
+  fail_check("Calibrators or Phase 3 registry not saved.")
+}
+
+if (!GATE_PASS) stop("Stage 9 quality gate failed -- see FAIL messages above.")
+cat("\nAll required checks passed.\n")
+```
+
+# Stage 9 checklist — confirm before moving on
+
+- [ ] `outputs/tables/p3_01_calibration_comparison.csv` through `p3_10_final_policy_comparison.csv` all exist
+- [ ] `outputs/figures/p3_policy_intervention_comparison.png` exists
+- [ ] `p3_01_calibration_comparison.csv` shows a clear winner (raw/platt/isotonic) for each model, chosen on `crc_calibration`'s internal tune slice, not on `iid_holdout` or `future_test`
+- [ ] The console printed "xgboost booster loaded from .ubj: N trees ..." and, for each model, a sanity line (mean predicted vs. observed return rate, AUC). Mean predicted should be close to the observed rate, and the xgboost AUC should match the figure Stage 8 reported for it
+- [ ] `p3_04_holdout_evaluation.csv`: note which alphas (if any) miss `risk_target_met_on_holdout` for which model -- this is the real, held-out test of the CRC guarantee, separate from the `crc_calibration`-side `feasible` flag in p3_02
+- [ ] `p3_09_recalibration_alert.csv` reviewed -- if TRUE for either model, that's a finding for the final report, not something to quietly drop
+- [ ] `p3_10_final_policy_comparison.csv` is the headline table for Phase 3 item 1 (final performance comparison) -- it reports the actual decision-relevant numbers (value-weighted risk, intervention rate) for both models at every alpha, not just AUC
+- [ ] STAGE 9 QUALITY GATE passed before any file was written
+
+```{r session-info}
+sessionInfo()
+```

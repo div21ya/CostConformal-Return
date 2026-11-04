@@ -1,0 +1,5 @@
+model_id,auc,pr_auc,brier,n_eval,evaluated_on,label,delta_vs_best,selected,reason,gap_ci_low,gap_ci_high
+xgboost,0.821080240650787,0.855387387222785,0.171043370816712,205432,full validation,XGBoost,0,TRUE,Highest validation AUC,,
+elastic_net_logistic,0.818814286185655,0.851809744060505,0.172584529085739,205432,full validation,Elastic-Net,0.00226595446513245,TRUE,Within 0.005 AUC of best; distinct model family,0.00199761070898796,0.0025569433989279
+random_forest,0.815595876569741,0.850515293184641,0.173616733908318,205432,full validation,Random Forest,0.00548436408104636,FALSE,More than the selection margin below best,0.0050532277615284,0.00593070054302779
+knn,0.786635304526253,0.83047200219847,0.18926498660036,5000,validation subsample,KNN,0.0344449361245338,FALSE,"Evaluated on 5,000-row subsample only and far below the others; excluded from Phase 3",,

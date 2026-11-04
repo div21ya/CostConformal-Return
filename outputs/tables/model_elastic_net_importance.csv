@@ -1,0 +1,16 @@
+feature,coefficient
+productReturnRate,7.99985634886687
+product_customer_risk_gap,-5.63941273467014
+shippingCountryOTHER,0.504603711459781
+customer_risk_tierHigh,-0.387352310455527
+customer_risk_tierMid,-0.326160454767732
+isMale,0.168391828936305
+productTypeproductType_F,0.148111000372901
+customer_missing,0.132607561643813
+productTypeproductType_D,-0.122564973204205
+productTypeproductType_C,0.118593694546175
+productTypeproductType_E,0.112079224414488
+customer_value_at_risk,0.106049703765297
+productTypeproductType_I,0.0956889099095357
+productTypeproductType_A,-0.094667694662046
+price_tierQ4_high,0.0780285533691667

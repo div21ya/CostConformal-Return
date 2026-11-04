@@ -1,0 +1,1122 @@
+{
+  "dataset": "ASOS GraphReturns",
+  "format": "gzip-compressed CSV",
+  "notes": [
+    "Original official files are .p (Python pickle); these .csv.gz files are converted working copies only - rows and values are unchanged.",
+    "All hash(...) identifier columns are written as text to avoid 64-bit precision loss when read into R.",
+    "Duplicate source headers are preserved (not deleted) with __duplicateN suffixes on the 2nd+ occurrence.",
+    "Training and testing files are never combined."
+  ],
+  "files": [
+    {
+      "source_file": "event_table_training.p",
+      "output_file": "event_table_training.csv.gz",
+      "rows": 1369133,
+      "columns": 3,
+      "column_name_mapping": [
+        {
+          "original": "hash(variantID)",
+          "converted": "hash(variantID)",
+          "occurrence": 1
+        },
+        {
+          "original": "hash(customerId)",
+          "converted": "hash(customerId)",
+          "occurrence": 1
+        },
+        {
+          "original": "isReturned",
+          "converted": "isReturned",
+          "occurrence": 1
+        }
+      ],
+      "duplicate_columns_renamed": [],
+      "hash_id_columns_written_as_text": [
+        "hash(variantID)",
+        "hash(customerId)"
+      ],
+      "converted_dtypes": {
+        "hash(variantID)": "string",
+        "hash(customerId)": "string",
+        "isReturned": "int64"
+      },
+      "output_bytes": 14365279,
+      "shape_check": {
+        "expected": [
+          1369133,
+          3
+        ],
+        "actual": [
+          1369133,
+          3
+        ],
+        "status": "PASS"
+      }
+    },
+    {
+      "source_file": "event_table_testing.p",
+      "output_file": "event_table_testing.csv.gz",
+      "rows": 1460366,
+      "columns": 3,
+      "column_name_mapping": [
+        {
+          "original": "hash(variantID)",
+          "converted": "hash(variantID)",
+          "occurrence": 1
+        },
+        {
+          "original": "hash(customerId)",
+          "converted": "hash(customerId)",
+          "occurrence": 1
+        },
+        {
+          "original": "isReturned",
+          "converted": "isReturned",
+          "occurrence": 1
+        }
+      ],
+      "duplicate_columns_renamed": [],
+      "hash_id_columns_written_as_text": [
+        "hash(variantID)",
+        "hash(customerId)"
+      ],
+      "converted_dtypes": {
+        "hash(variantID)": "string",
+        "hash(customerId)": "string",
+        "isReturned": "int64"
+      },
+      "output_bytes": 15125931,
+      "shape_check": {
+        "expected": [
+          1460366,
+          3
+        ],
+        "actual": [
+          1460366,
+          3
+        ],
+        "status": "PASS"
+      }
+    },
+    {
+      "source_file": "customer_nodes_training.p",
+      "output_file": "customer_nodes_training.csv.gz",
+      "rows": 777001,
+      "columns": 30,
+      "column_name_mapping": [
+        {
+          "original": "hash(customerId)",
+          "converted": "hash(customerId)",
+          "occurrence": 1
+        },
+        {
+          "original": "yearOfBirth",
+          "converted": "yearOfBirth",
+          "occurrence": 1
+        },
+        {
+          "original": "isMale",
+          "converted": "isMale",
+          "occurrence": 1
+        },
+        {
+          "original": "shippingCountry",
+          "converted": "shippingCountry",
+          "occurrence": 1
+        },
+        {
+          "original": "premier",
+          "converted": "premier",
+          "occurrence": 1
+        },
+        {
+          "original": "salesPerCustomer",
+          "converted": "salesPerCustomer",
+          "occurrence": 1
+        },
+        {
+          "original": "returnsPerCustomer",
+          "converted": "returnsPerCustomer",
+          "occurrence": 1
+        },
+        {
+          "original": "customerReturnRate",
+          "converted": "customerReturnRate",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_A",
+          "converted": "customerId_level_return_code_A",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_B",
+          "converted": "customerId_level_return_code_B",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_C",
+          "converted": "customerId_level_return_code_C",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_D",
+          "converted": "customerId_level_return_code_D",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_E",
+          "converted": "customerId_level_return_code_E",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_D",
+          "converted": "customerId_level_return_code_D__duplicate2",
+          "occurrence": 2
+        },
+        {
+          "original": "customerId_level_return_code_F",
+          "converted": "customerId_level_return_code_F",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_G",
+          "converted": "customerId_level_return_code_G",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_H",
+          "converted": "customerId_level_return_code_H",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_I",
+          "converted": "customerId_level_return_code_I",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_J",
+          "converted": "customerId_level_return_code_J",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_K",
+          "converted": "customerId_level_return_code_K",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_L",
+          "converted": "customerId_level_return_code_L",
+          "occurrence": 1
+        },
+        {
+          "original": "Country_A",
+          "converted": "Country_A",
+          "occurrence": 1
+        },
+        {
+          "original": "Country_B",
+          "converted": "Country_B",
+          "occurrence": 1
+        },
+        {
+          "original": "Country_C",
+          "converted": "Country_C",
+          "occurrence": 1
+        },
+        {
+          "original": "Country_D",
+          "converted": "Country_D",
+          "occurrence": 1
+        },
+        {
+          "original": "Country_E",
+          "converted": "Country_E",
+          "occurrence": 1
+        },
+        {
+          "original": "Country_F",
+          "converted": "Country_F",
+          "occurrence": 1
+        },
+        {
+          "original": "Country_G",
+          "converted": "Country_G",
+          "occurrence": 1
+        },
+        {
+          "original": "Country_H",
+          "converted": "Country_H",
+          "occurrence": 1
+        },
+        {
+          "original": "Country_I",
+          "converted": "Country_I",
+          "occurrence": 1
+        }
+      ],
+      "duplicate_columns_renamed": [
+        {
+          "original": "customerId_level_return_code_D",
+          "converted": "customerId_level_return_code_D__duplicate2",
+          "occurrence": 2
+        }
+      ],
+      "hash_id_columns_written_as_text": [
+        "hash(customerId)"
+      ],
+      "converted_dtypes": {
+        "hash(customerId)": "string",
+        "yearOfBirth": "int64",
+        "isMale": "int64",
+        "shippingCountry": "object",
+        "premier": "int64",
+        "salesPerCustomer": "int64",
+        "returnsPerCustomer": "int64",
+        "customerReturnRate": "float64",
+        "customerId_level_return_code_A": "float64",
+        "customerId_level_return_code_B": "float64",
+        "customerId_level_return_code_C": "float64",
+        "customerId_level_return_code_D": "float64",
+        "customerId_level_return_code_E": "float64",
+        "customerId_level_return_code_D__duplicate2": "float64",
+        "customerId_level_return_code_F": "float64",
+        "customerId_level_return_code_G": "float64",
+        "customerId_level_return_code_H": "float64",
+        "customerId_level_return_code_I": "float64",
+        "customerId_level_return_code_J": "float64",
+        "customerId_level_return_code_K": "float64",
+        "customerId_level_return_code_L": "float64",
+        "Country_A": "int64",
+        "Country_B": "int64",
+        "Country_C": "int64",
+        "Country_D": "int64",
+        "Country_E": "int64",
+        "Country_F": "int64",
+        "Country_G": "int64",
+        "Country_H": "int64",
+        "Country_I": "int64"
+      },
+      "output_bytes": 15175754,
+      "shape_check": {
+        "expected": [
+          777001,
+          30
+        ],
+        "actual": [
+          777001,
+          30
+        ],
+        "status": "PASS"
+      }
+    },
+    {
+      "source_file": "customer_nodes_testing.p",
+      "output_file": "customer_nodes_testing.csv.gz",
+      "rows": 825598,
+      "columns": 30,
+      "column_name_mapping": [
+        {
+          "original": "hash(customerId)",
+          "converted": "hash(customerId)",
+          "occurrence": 1
+        },
+        {
+          "original": "yearOfBirth",
+          "converted": "yearOfBirth",
+          "occurrence": 1
+        },
+        {
+          "original": "isMale",
+          "converted": "isMale",
+          "occurrence": 1
+        },
+        {
+          "original": "shippingCountry",
+          "converted": "shippingCountry",
+          "occurrence": 1
+        },
+        {
+          "original": "premier",
+          "converted": "premier",
+          "occurrence": 1
+        },
+        {
+          "original": "salesPerCustomer",
+          "converted": "salesPerCustomer",
+          "occurrence": 1
+        },
+        {
+          "original": "returnsPerCustomer",
+          "converted": "returnsPerCustomer",
+          "occurrence": 1
+        },
+        {
+          "original": "customerReturnRate",
+          "converted": "customerReturnRate",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_A",
+          "converted": "customerId_level_return_code_A",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_B",
+          "converted": "customerId_level_return_code_B",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_C",
+          "converted": "customerId_level_return_code_C",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_D",
+          "converted": "customerId_level_return_code_D",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_E",
+          "converted": "customerId_level_return_code_E",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_D",
+          "converted": "customerId_level_return_code_D__duplicate2",
+          "occurrence": 2
+        },
+        {
+          "original": "customerId_level_return_code_F",
+          "converted": "customerId_level_return_code_F",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_G",
+          "converted": "customerId_level_return_code_G",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_H",
+          "converted": "customerId_level_return_code_H",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_I",
+          "converted": "customerId_level_return_code_I",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_J",
+          "converted": "customerId_level_return_code_J",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_K",
+          "converted": "customerId_level_return_code_K",
+          "occurrence": 1
+        },
+        {
+          "original": "customerId_level_return_code_L",
+          "converted": "customerId_level_return_code_L",
+          "occurrence": 1
+        },
+        {
+          "original": "Country_A",
+          "converted": "Country_A",
+          "occurrence": 1
+        },
+        {
+          "original": "Country_B",
+          "converted": "Country_B",
+          "occurrence": 1
+        },
+        {
+          "original": "Country_C",
+          "converted": "Country_C",
+          "occurrence": 1
+        },
+        {
+          "original": "Country_D",
+          "converted": "Country_D",
+          "occurrence": 1
+        },
+        {
+          "original": "Country_E",
+          "converted": "Country_E",
+          "occurrence": 1
+        },
+        {
+          "original": "Country_F",
+          "converted": "Country_F",
+          "occurrence": 1
+        },
+        {
+          "original": "Country_G",
+          "converted": "Country_G",
+          "occurrence": 1
+        },
+        {
+          "original": "Country_H",
+          "converted": "Country_H",
+          "occurrence": 1
+        },
+        {
+          "original": "Country_I",
+          "converted": "Country_I",
+          "occurrence": 1
+        }
+      ],
+      "duplicate_columns_renamed": [
+        {
+          "original": "customerId_level_return_code_D",
+          "converted": "customerId_level_return_code_D__duplicate2",
+          "occurrence": 2
+        }
+      ],
+      "hash_id_columns_written_as_text": [
+        "hash(customerId)"
+      ],
+      "converted_dtypes": {
+        "hash(customerId)": "string",
+        "yearOfBirth": "int64",
+        "isMale": "int64",
+        "shippingCountry": "object",
+        "premier": "int64",
+        "salesPerCustomer": "int64",
+        "returnsPerCustomer": "int64",
+        "customerReturnRate": "float64",
+        "customerId_level_return_code_A": "float64",
+        "customerId_level_return_code_B": "float64",
+        "customerId_level_return_code_C": "float64",
+        "customerId_level_return_code_D": "float64",
+        "customerId_level_return_code_E": "float64",
+        "customerId_level_return_code_D__duplicate2": "float64",
+        "customerId_level_return_code_F": "float64",
+        "customerId_level_return_code_G": "float64",
+        "customerId_level_return_code_H": "float64",
+        "customerId_level_return_code_I": "float64",
+        "customerId_level_return_code_J": "float64",
+        "customerId_level_return_code_K": "float64",
+        "customerId_level_return_code_L": "float64",
+        "Country_A": "int64",
+        "Country_B": "int64",
+        "Country_C": "int64",
+        "Country_D": "int64",
+        "Country_E": "int64",
+        "Country_F": "int64",
+        "Country_G": "int64",
+        "Country_H": "int64",
+        "Country_I": "int64"
+      },
+      "output_bytes": 16423916,
+      "shape_check": {
+        "expected": [
+          825598,
+          30
+        ],
+        "actual": [
+          825598,
+          30
+        ],
+        "status": "PASS"
+      }
+    },
+    {
+      "source_file": "product_nodes_training.p",
+      "output_file": "product_nodes_training.csv.gz",
+      "rows": 411495,
+      "columns": 44,
+      "column_name_mapping": [
+        {
+          "original": "hash(variantID)",
+          "converted": "hash(variantID)",
+          "occurrence": 1
+        },
+        {
+          "original": "hash(productID)",
+          "converted": "hash(productID)",
+          "occurrence": 1
+        },
+        {
+          "original": "productType",
+          "converted": "productType",
+          "occurrence": 1
+        },
+        {
+          "original": "hash(supplierRef)",
+          "converted": "hash(supplierRef)",
+          "occurrence": 1
+        },
+        {
+          "original": "brandDesc",
+          "converted": "brandDesc",
+          "occurrence": 1
+        },
+        {
+          "original": "avgGbpPrice",
+          "converted": "avgGbpPrice",
+          "occurrence": 1
+        },
+        {
+          "original": "avgDiscountValue",
+          "converted": "avgDiscountValue",
+          "occurrence": 1
+        },
+        {
+          "original": "salesPerProduct",
+          "converted": "salesPerProduct",
+          "occurrence": 1
+        },
+        {
+          "original": "returnsPerProduct",
+          "converted": "returnsPerProduct",
+          "occurrence": 1
+        },
+        {
+          "original": "productReturnRate",
+          "converted": "productReturnRate",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_A",
+          "converted": "variantID_level_return_code_A",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_B",
+          "converted": "variantID_level_return_code_B",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_C",
+          "converted": "variantID_level_return_code_C",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_D",
+          "converted": "variantID_level_return_code_D",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_E",
+          "converted": "variantID_level_return_code_E",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_D",
+          "converted": "variantID_level_return_code_D__duplicate2",
+          "occurrence": 2
+        },
+        {
+          "original": "variantID_level_return_code_F",
+          "converted": "variantID_level_return_code_F",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_G",
+          "converted": "variantID_level_return_code_G",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_H",
+          "converted": "variantID_level_return_code_H",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_I",
+          "converted": "variantID_level_return_code_I",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_J",
+          "converted": "variantID_level_return_code_J",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_K",
+          "converted": "variantID_level_return_code_K",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_L",
+          "converted": "variantID_level_return_code_L",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_A",
+          "converted": "Brand_A",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_B",
+          "converted": "Brand_B",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_C",
+          "converted": "Brand_C",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_D",
+          "converted": "Brand_D",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_E",
+          "converted": "Brand_E",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_F",
+          "converted": "Brand_F",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_G",
+          "converted": "Brand_G",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_I",
+          "converted": "Brand_I",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_J",
+          "converted": "Brand_J",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_K",
+          "converted": "Brand_K",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_A",
+          "converted": "productType_A",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_B",
+          "converted": "productType_B",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_C",
+          "converted": "productType_C",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_D",
+          "converted": "productType_D",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_E",
+          "converted": "productType_E",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_F",
+          "converted": "productType_F",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_G",
+          "converted": "productType_G",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_H",
+          "converted": "productType_H",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_I",
+          "converted": "productType_I",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_J",
+          "converted": "productType_J",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_K",
+          "converted": "productType_K",
+          "occurrence": 1
+        }
+      ],
+      "duplicate_columns_renamed": [
+        {
+          "original": "variantID_level_return_code_D",
+          "converted": "variantID_level_return_code_D__duplicate2",
+          "occurrence": 2
+        }
+      ],
+      "hash_id_columns_written_as_text": [
+        "hash(variantID)",
+        "hash(productID)",
+        "hash(supplierRef)"
+      ],
+      "converted_dtypes": {
+        "hash(variantID)": "string",
+        "hash(productID)": "string",
+        "productType": "object",
+        "hash(supplierRef)": "string",
+        "brandDesc": "object",
+        "avgGbpPrice": "float64",
+        "avgDiscountValue": "float64",
+        "salesPerProduct": "int64",
+        "returnsPerProduct": "int64",
+        "productReturnRate": "float64",
+        "variantID_level_return_code_A": "float64",
+        "variantID_level_return_code_B": "float64",
+        "variantID_level_return_code_C": "float64",
+        "variantID_level_return_code_D": "float64",
+        "variantID_level_return_code_E": "float64",
+        "variantID_level_return_code_D__duplicate2": "float64",
+        "variantID_level_return_code_F": "float64",
+        "variantID_level_return_code_G": "float64",
+        "variantID_level_return_code_H": "float64",
+        "variantID_level_return_code_I": "float64",
+        "variantID_level_return_code_J": "float64",
+        "variantID_level_return_code_K": "float64",
+        "variantID_level_return_code_L": "float64",
+        "Brand_A": "int64",
+        "Brand_B": "int64",
+        "Brand_C": "int64",
+        "Brand_D": "int64",
+        "Brand_E": "int64",
+        "Brand_F": "int64",
+        "Brand_G": "int64",
+        "Brand_I": "int64",
+        "Brand_J": "int64",
+        "Brand_K": "int64",
+        "productType_A": "int64",
+        "productType_B": "int64",
+        "productType_C": "int64",
+        "productType_D": "int64",
+        "productType_E": "int64",
+        "productType_F": "int64",
+        "productType_G": "int64",
+        "productType_H": "int64",
+        "productType_I": "int64",
+        "productType_J": "int64",
+        "productType_K": "int64"
+      },
+      "output_bytes": 24119904,
+      "shape_check": {
+        "expected": [
+          411495,
+          44
+        ],
+        "actual": [
+          411495,
+          44
+        ],
+        "status": "PASS"
+      }
+    },
+    {
+      "source_file": "product_nodes_testing.p",
+      "output_file": "product_nodes_testing.csv.gz",
+      "rows": 411544,
+      "columns": 44,
+      "column_name_mapping": [
+        {
+          "original": "hash(variantID)",
+          "converted": "hash(variantID)",
+          "occurrence": 1
+        },
+        {
+          "original": "hash(productID)",
+          "converted": "hash(productID)",
+          "occurrence": 1
+        },
+        {
+          "original": "productType",
+          "converted": "productType",
+          "occurrence": 1
+        },
+        {
+          "original": "hash(supplierRef)",
+          "converted": "hash(supplierRef)",
+          "occurrence": 1
+        },
+        {
+          "original": "brandDesc",
+          "converted": "brandDesc",
+          "occurrence": 1
+        },
+        {
+          "original": "avgGbpPrice",
+          "converted": "avgGbpPrice",
+          "occurrence": 1
+        },
+        {
+          "original": "avgDiscountValue",
+          "converted": "avgDiscountValue",
+          "occurrence": 1
+        },
+        {
+          "original": "salesPerProduct",
+          "converted": "salesPerProduct",
+          "occurrence": 1
+        },
+        {
+          "original": "returnsPerProduct",
+          "converted": "returnsPerProduct",
+          "occurrence": 1
+        },
+        {
+          "original": "productReturnRate",
+          "converted": "productReturnRate",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_A",
+          "converted": "variantID_level_return_code_A",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_B",
+          "converted": "variantID_level_return_code_B",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_C",
+          "converted": "variantID_level_return_code_C",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_D",
+          "converted": "variantID_level_return_code_D",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_E",
+          "converted": "variantID_level_return_code_E",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_D",
+          "converted": "variantID_level_return_code_D__duplicate2",
+          "occurrence": 2
+        },
+        {
+          "original": "variantID_level_return_code_F",
+          "converted": "variantID_level_return_code_F",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_G",
+          "converted": "variantID_level_return_code_G",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_H",
+          "converted": "variantID_level_return_code_H",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_I",
+          "converted": "variantID_level_return_code_I",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_J",
+          "converted": "variantID_level_return_code_J",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_K",
+          "converted": "variantID_level_return_code_K",
+          "occurrence": 1
+        },
+        {
+          "original": "variantID_level_return_code_L",
+          "converted": "variantID_level_return_code_L",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_A",
+          "converted": "Brand_A",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_B",
+          "converted": "Brand_B",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_C",
+          "converted": "Brand_C",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_D",
+          "converted": "Brand_D",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_E",
+          "converted": "Brand_E",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_F",
+          "converted": "Brand_F",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_G",
+          "converted": "Brand_G",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_I",
+          "converted": "Brand_I",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_J",
+          "converted": "Brand_J",
+          "occurrence": 1
+        },
+        {
+          "original": "Brand_K",
+          "converted": "Brand_K",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_A",
+          "converted": "productType_A",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_B",
+          "converted": "productType_B",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_C",
+          "converted": "productType_C",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_D",
+          "converted": "productType_D",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_E",
+          "converted": "productType_E",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_F",
+          "converted": "productType_F",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_G",
+          "converted": "productType_G",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_H",
+          "converted": "productType_H",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_I",
+          "converted": "productType_I",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_J",
+          "converted": "productType_J",
+          "occurrence": 1
+        },
+        {
+          "original": "productType_K",
+          "converted": "productType_K",
+          "occurrence": 1
+        }
+      ],
+      "duplicate_columns_renamed": [
+        {
+          "original": "variantID_level_return_code_D",
+          "converted": "variantID_level_return_code_D__duplicate2",
+          "occurrence": 2
+        }
+      ],
+      "hash_id_columns_written_as_text": [
+        "hash(variantID)",
+        "hash(productID)",
+        "hash(supplierRef)"
+      ],
+      "converted_dtypes": {
+        "hash(variantID)": "string",
+        "hash(productID)": "string",
+        "productType": "object",
+        "hash(supplierRef)": "string",
+        "brandDesc": "object",
+        "avgGbpPrice": "float64",
+        "avgDiscountValue": "float64",
+        "salesPerProduct": "int64",
+        "returnsPerProduct": "int64",
+        "productReturnRate": "float64",
+        "variantID_level_return_code_A": "float64",
+        "variantID_level_return_code_B": "float64",
+        "variantID_level_return_code_C": "float64",
+        "variantID_level_return_code_D": "float64",
+        "variantID_level_return_code_E": "float64",
+        "variantID_level_return_code_D__duplicate2": "float64",
+        "variantID_level_return_code_F": "float64",
+        "variantID_level_return_code_G": "float64",
+        "variantID_level_return_code_H": "float64",
+        "variantID_level_return_code_I": "float64",
+        "variantID_level_return_code_J": "float64",
+        "variantID_level_return_code_K": "float64",
+        "variantID_level_return_code_L": "float64",
+        "Brand_A": "int64",
+        "Brand_B": "int64",
+        "Brand_C": "int64",
+        "Brand_D": "int64",
+        "Brand_E": "int64",
+        "Brand_F": "int64",
+        "Brand_G": "int64",
+        "Brand_I": "int64",
+        "Brand_J": "int64",
+        "Brand_K": "int64",
+        "productType_A": "int64",
+        "productType_B": "int64",
+        "productType_C": "int64",
+        "productType_D": "int64",
+        "productType_E": "int64",
+        "productType_F": "int64",
+        "productType_G": "int64",
+        "productType_H": "int64",
+        "productType_I": "int64",
+        "productType_J": "int64",
+        "productType_K": "int64"
+      },
+      "output_bytes": 24128183,
+      "shape_check": {
+        "expected": [
+          411544,
+          44
+        ],
+        "actual": [
+          411544,
+          44
+        ],
+        "status": "PASS"
+      }
+    }
+  ]
+}

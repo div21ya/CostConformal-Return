@@ -1,0 +1,34 @@
+feature,role
+variant_id,join/audit identifier
+customer_id,join/audit identifier
+isReturned,target
+analysis_split,split label
+customer_node_found,predictive/audit feature
+product_node_found,predictive/audit feature
+yearOfBirth,predictive/audit feature
+age,predictive/audit feature
+age_band,predictive/audit feature
+isMale,predictive/audit feature
+shippingCountry,predictive/audit feature
+premier,predictive/audit feature
+salesPerCustomer,predictive/audit feature
+returnsPerCustomer,predictive/audit feature
+customerReturnRate,predictive/audit feature
+log_sales_customer,predictive/audit feature
+log_returns_customer,predictive/audit feature
+productType,predictive/audit feature
+brandDesc,predictive/audit feature
+avgGbpPrice,predictive/audit feature
+avgDiscountValue,predictive/audit feature
+salesPerProduct,predictive/audit feature
+returnsPerProduct,predictive/audit feature
+productReturnRate,predictive/audit feature
+log_sales_product,predictive/audit feature
+log_returns_product,predictive/audit feature
+discount_ratio,predictive/audit feature
+type_median_price,predictive/audit feature
+price_to_type_median,predictive/audit feature
+value_exposure,bounded policy exposure
+customer_missing,predictive/audit feature
+product_missing,predictive/audit feature
+missingness_count,predictive/audit feature

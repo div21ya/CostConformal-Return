@@ -1,0 +1,501 @@
+---
+title: "CostConformal-Return — Stage 6: Model Zoo (10–15 ML/DL Algorithms)"
+subtitle: "Category-Aware and Future-Period Drift-Audited Conformal Risk Control for Value-Sensitive E-Commerce Returns"
+author: "Simran Kumari (24BDS1031)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    df-print: kable
+    theme: cosmo
+execute:
+  warning: false
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath("."))
+```
+
+# Purpose of this stage
+
+Stage 6 fits 14 algorithms unconditionally, plus LightGBM as a 15th if it is installed (see "Package availability" below) -- satisfying Phase 2's 10-15-algorithm requirement comfortably either way. Data comes from Stage 5's SQLite database via `load_split_from_db()`, not from raw `*_features.csv.gz` reads, and predictor sets come from Stage 4's `r_feature_selector.rds` (`linear_features` for linear/distance models, `tree_features` for tree/boosting models).
+
+Each model is fit on `model_train`, scored on `validation`, and both the fitted model object and its validation predictions are saved -- this stage's job is *implementation*, not tuning (Stage 7) or final comparison (Stage 8), so default/reasonable hyperparameters are used throughout.
+
+## Memory and robustness profile (6 GB RAM)
+
+- **`model_train` is frozen to a 250k-row pool once, immediately after loading, and the full 890k-row table is freed.** No model in this stage trains on more than `DEFAULT_TRAIN_CAP` (250,000) rows, and every 250k-capped model already called `set.seed(20260917)` right before sampling from the *same* source table -- so all nine of them were already receiving an identical sample. Holding 890k rows resident for the whole stage bought nothing; this is a pure memory fix with zero effect on those nine models, and only a minor (still properly `isReturned`-stratified) change of sampling *pool* for the smaller-cap models below.
+- **KNN's caps are deliberately much smaller than the others (8,000 train / 5,000 scored).** `kknn` computes a full train x test distance structure -- at the previous 30k/20k caps that's a 30,000 x 20,000 array of doubles, roughly **4.8 GB on its own**. This was the single biggest risk in the original design. At 8,000 x 5,000 that drops to \~320 MB.
+- **SVM's caps (15,000 / 15,000) are intentionally left larger than KNN's.** `e1071::svm` (libsvm) bounds its kernel cache explicitly rather than materializing an O(n_train x n_test) array the way `kknn` does, so it was never the same category of risk -- shrinking it further would only cost accuracy for no real memory benefit.
+- **Random Forest / Extra Trees** now use `sample.fraction = 0.5` (each of `num.trees` trees bootstraps half the data, not all of it) and `num.trees` is reduced from 300 to 200 -- standard subbagging, trims per-tree memory without materially hurting the ensemble.
+- **XGBoost / LightGBM** cap `max_bin` at 128 (default 256) -- histogram memory scales with this directly.
+- **GBM / Neural Net** caps trimmed further (150k-\>100k, 100k-\>60k) as cheap extra headroom, since both had less to lose in exchange for the smaller sample than KNN/SVM did.
+- **One model fit at a time**, training subsample/design matrix/fitted object freed (`rm()` + `gc()`) before the next model starts; every model fit is wrapped in `tryCatch` so one failure doesn't take down the rest.
+
+## Package availability
+
+`glmnet`, `MASS`, `naivebayes`, `kknn`, `rpart`, `ranger`, `gbm`, `xgboost`, `e1071`, `nnet` are required (`MASS`/`rpart`/`nnet` ship with base R's recommended-package set and are usually already present). **`lightgbm` is optional** -- if `requireNamespace("lightgbm", quietly = TRUE)` fails, that one model is skipped with a clear note, rather than failing the whole stage.
+
+# Before you render this document
+
+1.  Save this file as `06_model_zoo.qmd` in the project root.
+2.  Confirm Stage 5's checklist is fully green -- `data/costconformal_return.sqlite` must exist with all 5 tables populated.
+3.  Render with `Ctrl/Cmd+Shift+K`, or run chunk-by-chunk. This is still the most compute-heavy stage so far; expect it to take a while even with the RAM fixes above.
+
+# Setup
+
+```{r source-setup}
+source(file.path("R", "00_setup.R"))
+data.table::setDTthreads(2)
+
+required_packages <- c(
+  "DBI", "RSQLite", "glmnet", "MASS", "naivebayes", "kknn",
+  "rpart", "ranger", "gbm", "xgboost", "e1071", "nnet"
+)
+missing_packages <- setdiff(required_packages, rownames(installed.packages()))
+if (length(missing_packages) > 0) install.packages(missing_packages)
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+LIGHTGBM_AVAILABLE <- requireNamespace("lightgbm", quietly = TRUE)
+if (LIGHTGBM_AVAILABLE) {
+  library(lightgbm)
+} else {
+  cat("NOTE: lightgbm is not installed in this environment -- it will be skipped.",
+      "14 of a possible 15 models will be fit, still within the 10-15 requirement.\n")
+}
+
+MODEL_ZOO_DIR <- file.path(MODEL_DIR, "model_zoo")
+dir.create(MODEL_ZOO_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# Per-algorithm compute/RAM budget -- see "Memory and robustness profile"
+# above for why each of these numbers is what it is.
+DEFAULT_TRAIN_CAP <- 250000
+KNN_TRAIN_N <- 8000;   KNN_VAL_N <- 5000
+SVM_TRAIN_N <- 15000;  SVM_VAL_N <- 15000
+GBM_TRAIN_N <- 100000
+NNET_TRAIN_N <- 60000
+RF_NUM_TREES <- 200
+RF_SAMPLE_FRACTION <- 0.5
+GBM_NUM_TREES <- 200
+XGB_NROUNDS <- 150
+LGB_NROUNDS <- 150
+HIST_MAX_BIN <- 128
+TREE_NUM_THREADS <- 2
+```
+
+# Load data via Stage 5's database
+
+```{r load-data}
+DB_PATH <- file.path("data", "costconformal_return.sqlite")
+if (!file.exists(DB_PATH)) stop("Stage 5's database not found at ", DB_PATH, " -- run 05_database_connectivity.qmd first.")
+
+preprocessor <- readRDS(file.path(MODEL_DIR, "r_preprocessor.rds"))
+feature_selector <- readRDS(file.path(MODEL_DIR, "r_feature_selector.rds"))
+
+bin_label_levels <- function(fs) {
+  bd <- fs$bin_definitions
+  list(
+    price_tier = c("Q1_low", "Q2", "Q3", "Q4_high")[seq_len(length(bd$price_breaks) - 1)],
+    customer_risk_tier = c("Low", "Mid", "High")[seq_len(length(bd$risk_breaks) - 1)]
+  )
+}
+BIN_LEVELS <- bin_label_levels(feature_selector)
+
+load_split_from_db <- function(con, split_name, preprocessor, feature_selector, bin_levels) {
+  dt <- as.data.table(DBI::dbGetQuery(con, paste0("SELECT * FROM ", split_name)))
+  for (col in feature_selector$categorical_features) {
+    if (col %in% names(dt)) {
+      levs <- union(preprocessor$allowed_levels[[col]], "OTHER")
+      set(dt, j = col, value = factor(dt[[col]], levels = levs))
+    }
+  }
+  for (col in names(bin_levels)) {
+    if (col %in% names(dt)) set(dt, j = col, value = factor(dt[[col]], levels = bin_levels[[col]]))
+  }
+  dt
+}
+
+con <- DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
+model_train_full <- load_split_from_db(con, "model_train", preprocessor, feature_selector, BIN_LEVELS)
+validation <- load_split_from_db(con, "validation", preprocessor, feature_selector, BIN_LEVELS)
+DBI::dbDisconnect(con)
+
+cat("model_train (full):", nrow(model_train_full), "rows | validation:", nrow(validation), "rows.\n")
+
+LINEAR_PREDICTORS <- unique(c(
+  feature_selector$linear_numeric_features, feature_selector$categorical_features,
+  feature_selector$binary_features, feature_selector$missingness_flags, feature_selector$binned_features
+))
+TREE_PREDICTORS <- unique(c(
+  feature_selector$tree_numeric_features, feature_selector$categorical_features,
+  feature_selector$binary_features, feature_selector$missingness_flags, feature_selector$binned_features
+))
+cat("Linear-family predictors (", length(LINEAR_PREDICTORS), "):", paste(LINEAR_PREDICTORS, collapse = ", "), "\n")
+cat("Tree-family predictors (", length(TREE_PREDICTORS), "):", paste(TREE_PREDICTORS, collapse = ", "), "\n")
+```
+
+# Shared helpers
+
+```{r shared-helpers}
+stratified_sample <- function(dt, max_n) {
+  if (nrow(dt) <= max_n) return(dt)
+  frac <- max_n / nrow(dt)
+  dt[, .SD[sample(.N, size = max(1, round(.N * frac)))], by = isReturned]
+}
+
+build_onehot <- function(dt, predictors) {
+  model.matrix(as.formula(paste("~", paste(predictors, collapse = " + "), "- 1")), data = dt)
+}
+
+align_onehot <- function(x, train_colnames) {
+  missing_cols <- setdiff(train_colnames, colnames(x))
+  for (mc in missing_cols) x <- cbind(x, stats::setNames(data.frame(rep(0, nrow(x))), mc))
+  x[, train_colnames, drop = FALSE]
+}
+
+fit_numeric_scale <- function(dt, numeric_cols) {
+  list(
+    center = sapply(numeric_cols, function(c) mean(dt[[c]], na.rm = TRUE)),
+    scale  = sapply(numeric_cols, function(c) { s <- sd(dt[[c]], na.rm = TRUE); if (s == 0) 1 else s })
+  )
+}
+apply_numeric_scale <- function(dt, sp) {
+  dt <- copy(dt)
+  for (c in names(sp$center)) set(dt, j = c, value = (dt[[c]] - sp$center[[c]]) / sp$scale[[c]])
+  dt
+}
+
+compute_metrics <- function(y, p) {
+  p <- pmin(pmax(p, 1e-6), 1 - 1e-6)
+  pred_class <- as.integer(p >= 0.5)
+  tp <- sum(pred_class == 1 & y == 1); fp <- sum(pred_class == 1 & y == 0)
+  tn <- sum(pred_class == 0 & y == 0); fn <- sum(pred_class == 0 & y == 1)
+  precision <- if ((tp + fp) == 0) NA_real_ else tp / (tp + fp)
+  recall <- if ((tp + fn) == 0) NA_real_ else tp / (tp + fn)
+  f1 <- if (is.na(precision) || is.na(recall) || (precision + recall) == 0) NA_real_ else 2 * precision * recall / (precision + recall)
+  data.table(
+    auc = auc_roc(y, p), pr_auc = pr_auc(y, p), brier = brier_score(y, p), log_loss = log_loss(y, p),
+    accuracy = (tp + tn) / length(y), precision = precision, recall = recall, f1 = f1
+  )
+}
+
+run_model <- function(id, family, fit_fn, predict_fn, train_cap, val_cap = NULL) {
+  cat("\n=== Fitting:", id, "===\n")
+  set.seed(20260917)
+  train_sub <- stratified_sample(model_train, train_cap)
+
+  val_idx <- if (!is.null(val_cap) && nrow(validation) > val_cap) {
+    sort(sample.int(nrow(validation), val_cap))
+  } else {
+    seq_len(nrow(validation))
+  }
+  val_sub <- validation[val_idx]
+
+  t0 <- Sys.time()
+  fit <- fit_fn(train_sub)
+  fit_seconds <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+
+  prob <- predict_fn(fit, val_sub)
+  metrics <- compute_metrics(val_sub$isReturned, prob)
+  metrics[, `:=`(model_id = id, family = family, train_n = nrow(train_sub), val_n = nrow(val_sub), fit_seconds = fit_seconds)]
+
+  saveRDS(fit, file.path(MODEL_ZOO_DIR, paste0(id, ".rds")))
+  cat("Done:", id, "-- AUC:", round(metrics$auc, 4), "| fit time:", round(fit_seconds, 1), "s\n")
+
+  rm(train_sub, val_sub, fit)
+  invisible(gc(verbose = FALSE))
+  list(metrics = metrics, prob = prob, idx = val_idx)
+}
+```
+
+# Freeze the training pool (the main RAM fix)
+
+```{r freeze-training-pool}
+set.seed(20260917)
+model_train <- stratified_sample(model_train_full, DEFAULT_TRAIN_CAP)
+rm(model_train_full)
+invisible(gc(verbose = FALSE))
+cat("model_train (frozen pool for this stage):", nrow(model_train), "rows.\n")
+```
+
+# Model definitions
+
+## Linear-family models (use `LINEAR_PREDICTORS`)
+
+```{r fit-fns-linear}
+fit_logistic <- function(train_sub) {
+  glm(as.formula(paste("isReturned ~", paste(LINEAR_PREDICTORS, collapse = " + "))),
+      data = train_sub, family = binomial())
+}
+predict_logistic <- function(fit, newdata) as.numeric(predict(fit, newdata = newdata, type = "response"))
+
+fit_glmnet_selected <- function(train_sub, alpha) {
+  n <- nrow(train_sub)
+  tune_idx <- sample.int(n, size = round(0.2 * n))
+  fit_idx <- setdiff(seq_len(n), tune_idx)
+
+  x_fit <- build_onehot(train_sub[fit_idx], LINEAR_PREDICTORS)
+  y_fit <- train_sub$isReturned[fit_idx]
+  path <- glmnet(x_fit, y_fit, family = "binomial", alpha = alpha, standardize = TRUE)
+
+  x_tune <- build_onehot(train_sub[tune_idx], LINEAR_PREDICTORS)
+  y_tune <- train_sub$isReturned[tune_idx]
+  pred_path <- predict(path, newx = x_tune, type = "response")
+  briers <- apply(pred_path, 2, function(p) brier_score(y_tune, p))
+  best_lambda <- path$lambda[which.min(briers)]
+
+  x_full <- build_onehot(train_sub, LINEAR_PREDICTORS)
+  final_model <- glmnet(x_full, train_sub$isReturned, family = "binomial", alpha = alpha, lambda = best_lambda, standardize = TRUE)
+  list(model = final_model, lambda = best_lambda, predictors = LINEAR_PREDICTORS, train_colnames = colnames(x_full))
+}
+predict_glmnet_selected <- function(fit, newdata) {
+  x <- align_onehot(build_onehot(newdata, fit$predictors), fit$train_colnames)
+  as.numeric(predict(fit$model, newx = x, s = fit$lambda, type = "response"))
+}
+
+fit_lda <- function(train_sub) {
+  train_sub[, y_factor := factor(isReturned, levels = c(0, 1), labels = c("No", "Yes"))]
+  MASS::lda(as.formula(paste("y_factor ~", paste(LINEAR_PREDICTORS, collapse = " + "))), data = train_sub)
+}
+predict_lda <- function(fit, newdata) as.numeric(predict(fit, newdata = newdata)$posterior[, "Yes"])
+
+fit_naive_bayes <- function(train_sub) {
+  train_sub[, y_factor := factor(isReturned, levels = c(0, 1), labels = c("No", "Yes"))]
+  naivebayes::naive_bayes(as.formula(paste("y_factor ~", paste(LINEAR_PREDICTORS, collapse = " + "))),
+                           data = train_sub, usekernel = TRUE)
+}
+predict_naive_bayes <- function(fit, newdata) as.numeric(predict(fit, newdata = newdata, type = "prob")[, "Yes"])
+
+# KNN is a lazy learner -- the "fit" is the frozen training subsample + k;
+# kknn() both fits and predicts in one call. See the memory-profile note
+# above for why its caps are much smaller than every other model's.
+fit_knn <- function(train_sub) {
+  train_sub[, y_factor := factor(isReturned, levels = c(0, 1), labels = c("No", "Yes"))]
+  list(train_data = train_sub, k = 15)
+}
+predict_knn <- function(fit, newdata) {
+  nd <- copy(newdata)
+  nd[, y_factor := factor(NA, levels = c("No", "Yes"))]
+  res <- kknn::kknn(as.formula(paste("y_factor ~", paste(LINEAR_PREDICTORS, collapse = " + "))),
+                     train = fit$train_data, test = nd, k = fit$k, kernel = "optimal", scale = TRUE)
+  as.numeric(res$prob[, "Yes"])
+}
+
+fit_svm <- function(train_sub) {
+  train_sub[, y_factor := factor(isReturned, levels = c(0, 1), labels = c("No", "Yes"))]
+  e1071::svm(as.formula(paste("y_factor ~", paste(LINEAR_PREDICTORS, collapse = " + "))),
+             data = train_sub, kernel = "linear", probability = TRUE, scale = TRUE)
+}
+predict_svm <- function(fit, newdata) {
+  pred <- predict(fit, newdata = newdata, probability = TRUE)
+  as.numeric(attr(pred, "probabilities")[, "Yes"])
+}
+
+fit_nnet <- function(train_sub) {
+  scale_params <- fit_numeric_scale(train_sub, feature_selector$linear_numeric_features)
+  train_scaled <- apply_numeric_scale(train_sub, scale_params)
+  model <- nnet::nnet(as.formula(paste("isReturned ~", paste(LINEAR_PREDICTORS, collapse = " + "))),
+                       data = train_scaled, size = 8, decay = 0.01, maxit = 200, linout = FALSE, trace = FALSE)
+  list(model = model, scale_params = scale_params)
+}
+predict_nnet <- function(fit, newdata) {
+  nd_scaled <- apply_numeric_scale(newdata, fit$scale_params)
+  as.numeric(predict(fit$model, newdata = nd_scaled, type = "raw"))
+}
+```
+
+## Tree/boosting-family models (use `TREE_PREDICTORS`)
+
+```{r fit-fns-tree}
+fit_rpart <- function(train_sub) {
+  train_sub[, y_factor := factor(isReturned, levels = c(0, 1), labels = c("No", "Yes"))]
+  rpart::rpart(as.formula(paste("y_factor ~", paste(TREE_PREDICTORS, collapse = " + "))),
+               data = train_sub, method = "class", control = rpart::rpart.control(cp = 0.0005, maxdepth = 12))
+}
+predict_rpart <- function(fit, newdata) as.numeric(predict(fit, newdata = newdata, type = "prob")[, "Yes"])
+
+fit_rf <- function(train_sub) {
+  train_sub[, y_factor := factor(isReturned, levels = c(0, 1), labels = c("No", "Yes"))]
+  ranger::ranger(as.formula(paste("y_factor ~", paste(TREE_PREDICTORS, collapse = " + "))),
+                 data = train_sub, num.trees = RF_NUM_TREES, probability = TRUE,
+                 sample.fraction = RF_SAMPLE_FRACTION, num.threads = TREE_NUM_THREADS, seed = 20260917)
+}
+predict_rf <- function(fit, newdata) as.numeric(predict(fit, data = newdata)$predictions[, "Yes"])
+
+fit_extratrees <- function(train_sub) {
+  train_sub[, y_factor := factor(isReturned, levels = c(0, 1), labels = c("No", "Yes"))]
+  ranger::ranger(as.formula(paste("y_factor ~", paste(TREE_PREDICTORS, collapse = " + "))),
+                 data = train_sub, num.trees = RF_NUM_TREES, probability = TRUE,
+                 splitrule = "extratrees", num.random.splits = 3, sample.fraction = RF_SAMPLE_FRACTION,
+                 num.threads = TREE_NUM_THREADS, seed = 20260917)
+}
+predict_extratrees <- predict_rf
+
+fit_gbm <- function(train_sub) {
+  gbm::gbm(as.formula(paste("isReturned ~", paste(TREE_PREDICTORS, collapse = " + "))),
+           data = train_sub, distribution = "bernoulli", n.trees = GBM_NUM_TREES,
+           interaction.depth = 3, shrinkage = 0.05, n.cores = TREE_NUM_THREADS, verbose = FALSE)
+}
+predict_gbm <- function(fit, newdata) as.numeric(predict(fit, newdata = newdata, n.trees = fit$n.trees, type = "response"))
+
+fit_xgboost <- function(train_sub) {
+  x <- build_onehot(train_sub, TREE_PREDICTORS)
+  dtrain <- xgboost::xgb.DMatrix(data = x, label = train_sub$isReturned)
+  model <- xgboost::xgb.train(
+    params = list(objective = "binary:logistic", max_depth = 6, eta = 0.1, nthread = TREE_NUM_THREADS, max_bin = HIST_MAX_BIN),
+    data = dtrain, nrounds = XGB_NROUNDS, verbose = 0
+  )
+  list(model = model, predictors = TREE_PREDICTORS, train_colnames = colnames(x))
+}
+predict_xgboost <- function(fit, newdata) {
+  x <- align_onehot(build_onehot(newdata, fit$predictors), fit$train_colnames)
+  as.numeric(predict(fit$model, newdata = x))
+}
+
+if (LIGHTGBM_AVAILABLE) {
+  fit_lightgbm <- function(train_sub) {
+    x <- build_onehot(train_sub, TREE_PREDICTORS)
+    dtrain <- lightgbm::lgb.Dataset(data = x, label = train_sub$isReturned)
+    model <- lightgbm::lgb.train(
+      params = list(objective = "binary", num_threads = TREE_NUM_THREADS, learning_rate = 0.1,
+                     max_depth = 6, max_bin = HIST_MAX_BIN),
+      data = dtrain, nrounds = LGB_NROUNDS, verbose = -1
+    )
+    list(model = model, predictors = TREE_PREDICTORS, train_colnames = colnames(x))
+  }
+  predict_lightgbm <- function(fit, newdata) {
+    x <- align_onehot(build_onehot(newdata, fit$predictors), fit$train_colnames)
+    as.numeric(predict(fit$model, x))
+  }
+}
+```
+
+# The model zoo registry
+
+```{r model-zoo-registry}
+model_zoo_spec <- list(
+  list(id = "logistic_regression",   family = "linear", train_cap = DEFAULT_TRAIN_CAP, val_cap = NULL,
+       fit_fn = fit_logistic, predict_fn = predict_logistic),
+  list(id = "ridge_logistic",        family = "linear", train_cap = DEFAULT_TRAIN_CAP, val_cap = NULL,
+       fit_fn = function(d) fit_glmnet_selected(d, alpha = 0),   predict_fn = predict_glmnet_selected),
+  list(id = "lasso_logistic",        family = "linear", train_cap = DEFAULT_TRAIN_CAP, val_cap = NULL,
+       fit_fn = function(d) fit_glmnet_selected(d, alpha = 1),   predict_fn = predict_glmnet_selected),
+  list(id = "elastic_net_logistic",  family = "linear", train_cap = DEFAULT_TRAIN_CAP, val_cap = NULL,
+       fit_fn = function(d) fit_glmnet_selected(d, alpha = 0.5), predict_fn = predict_glmnet_selected),
+  list(id = "lda",                   family = "linear", train_cap = DEFAULT_TRAIN_CAP, val_cap = NULL,
+       fit_fn = fit_lda, predict_fn = predict_lda),
+  list(id = "naive_bayes",           family = "linear", train_cap = DEFAULT_TRAIN_CAP, val_cap = NULL,
+       fit_fn = fit_naive_bayes, predict_fn = predict_naive_bayes),
+  list(id = "knn",                   family = "linear", train_cap = KNN_TRAIN_N, val_cap = KNN_VAL_N,
+       fit_fn = fit_knn, predict_fn = predict_knn),
+  list(id = "svm_linear",            family = "linear", train_cap = SVM_TRAIN_N, val_cap = SVM_VAL_N,
+       fit_fn = fit_svm, predict_fn = predict_svm),
+  list(id = "neural_net",            family = "linear", train_cap = NNET_TRAIN_N, val_cap = NULL,
+       fit_fn = fit_nnet, predict_fn = predict_nnet),
+  list(id = "decision_tree",         family = "tree", train_cap = DEFAULT_TRAIN_CAP, val_cap = NULL,
+       fit_fn = fit_rpart, predict_fn = predict_rpart),
+  list(id = "random_forest",         family = "tree", train_cap = DEFAULT_TRAIN_CAP, val_cap = NULL,
+       fit_fn = fit_rf, predict_fn = predict_rf),
+  list(id = "extra_trees",           family = "tree", train_cap = DEFAULT_TRAIN_CAP, val_cap = NULL,
+       fit_fn = fit_extratrees, predict_fn = predict_extratrees),
+  list(id = "gbm",                   family = "tree", train_cap = GBM_TRAIN_N, val_cap = NULL,
+       fit_fn = fit_gbm, predict_fn = predict_gbm),
+  list(id = "xgboost",               family = "tree", train_cap = DEFAULT_TRAIN_CAP, val_cap = NULL,
+       fit_fn = fit_xgboost, predict_fn = predict_xgboost)
+)
+
+if (LIGHTGBM_AVAILABLE) {
+  model_zoo_spec <- c(model_zoo_spec, list(list(
+    id = "lightgbm", family = "tree", train_cap = DEFAULT_TRAIN_CAP, val_cap = NULL,
+    fit_fn = fit_lightgbm, predict_fn = predict_lightgbm
+  )))
+}
+
+cat(length(model_zoo_spec), "models registered.\n")
+```
+
+# Fit every model, one at a time
+
+```{r run-all-models}
+validation_results <- validation[, .(customer_id, variant_id, isReturned, value_exposure)]
+
+model_zoo_results <- list()
+model_zoo_failures <- list()
+
+for (spec in model_zoo_spec) {
+  result <- tryCatch(
+    run_model(spec$id, spec$family, spec$fit_fn, spec$predict_fn, spec$train_cap, spec$val_cap),
+    error = function(e) {
+      cat("FAILED:", spec$id, "--", conditionMessage(e), "\n")
+      model_zoo_failures[[length(model_zoo_failures) + 1]] <<- data.table(model_id = spec$id, error = conditionMessage(e))
+      NULL
+    }
+  )
+  if (!is.null(result)) {
+    model_zoo_results[[length(model_zoo_results) + 1]] <- result$metrics
+    validation_results[result$idx, (paste0("prob_", spec$id)) := result$prob]
+  }
+}
+
+leaderboard <- rbindlist(model_zoo_results, fill = TRUE)
+setorder(leaderboard, -auc)
+failures <- if (length(model_zoo_failures) > 0) rbindlist(model_zoo_failures) else data.table(model_id = character(0), error = character(0))
+
+leaderboard
+if (nrow(failures) > 0) { cat("\nFailed model(s):\n"); print(failures) }
+```
+
+# Quality gate
+
+```{r quality-gate}
+cat("\n============================================================\n")
+cat("STAGE 6 QUALITY GATE\n")
+cat("============================================================\n\n")
+
+GATE_PASS <- TRUE
+fail_check <- function(msg) { cat("FAIL:", msg, "\n"); GATE_PASS <<- FALSE }
+warn_check <- function(msg) cat("WARN:", msg, "\n")
+pass_check <- function(msg) cat("PASS:", msg, "\n")
+
+n_fit <- nrow(leaderboard)
+if (n_fit < 10) fail_check(paste("Only", n_fit, "model(s) fit successfully -- below the 10-15 requirement.")) else pass_check(paste(n_fit, "models fit successfully (10-15 required)."))
+if (anyDuplicated(leaderboard$model_id) > 0) fail_check("Duplicate model_id in leaderboard.") else pass_check("No duplicate model_id in leaderboard.")
+
+below_chance <- leaderboard[auc <= 0.5, model_id]
+if (length(below_chance) > 0) warn_check(paste("Model(s) at or below random-chance AUC:", paste(below_chance, collapse = ", "), "-- inspect before Stage 7/8.")) else pass_check("Every fitted model beats random-chance AUC (0.5).")
+
+if (!GATE_PASS) stop("Stage 6 quality gate failed -- see FAIL messages above.")
+cat("\nAll required checks passed.\n")
+```
+
+# Writing Stage 6 outputs
+
+```{r write-outputs}
+fwrite(leaderboard, file.path(TABLE_DIR, "model_zoo_01_leaderboard.csv"))
+fwrite(failures, file.path(TABLE_DIR, "model_zoo_02_failures.csv"))
+fwrite(validation_results, file.path(PROCESSED_DIR, "model_zoo_validation_predictions.csv.gz"), compress = "gzip")
+
+message("Wrote ", n_fit, " model(s) to ", MODEL_ZOO_DIR, "/, the leaderboard, and validation predictions.")
+```
+
+# Stage 6 checklist — confirm before moving on
+
+- [ ] `outputs/tables/model_zoo_01_leaderboard.csv` has between 10 and 15 rows, one per successfully-fit model
+- [ ] `outputs/tables/model_zoo_02_failures.csv` exists (possibly empty)
+- [ ] `models/model_zoo/` contains one `.rds` file per successfully-fit model
+- [ ] `data/processed/model_zoo_validation_predictions.csv.gz` exists, with one `prob_<model_id>` column per fitted model -- `knn`/`svm_linear` columns will have `NA` outside their capped scoring subsample, by design
+- [ ] No model's AUC is far below 0.5 without an explanation noted
+- [ ] **STAGE 6 QUALITY GATE** printed with 10+ models passing before any file was written
+- [ ] Console output showed `model_train (frozen pool for this stage): 250000 rows` (or less, if `model_train_full` had fewer) before any model fit began -- confirms the RAM fix actually took effect
+
+Stage 7 (hyperparameter tuning) and Stage 8 (comparative evaluation) both read `outputs/tables/model_zoo_01_leaderboard.csv`, `models/model_zoo/*.rds`, and `data/processed/model_zoo_validation_predictions.csv.gz`.
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,540 @@
+---
+title: "CostConformal-Return — Stage 1: Data Preparation, Validation, Leakage-Safe Joins and Splits"
+subtitle: "Category-Aware and Future-Period Drift-Audited Conformal Risk Control for Value-Sensitive E-Commerce Returns"
+author: "Simran Kumari (24BDS1031)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    df-print: kable
+    theme: cosmo
+execute:
+  warning: false
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE)
+
+# This document must live in the PROJECT ROOT, next to CostConformal-Return.Rproj,
+# so that relative paths ("R/00_setup.R", "data/raw_csv_gz/...") resolve exactly
+# the way they do in the original R/01_data_preparation.R script.
+knitr::opts_knit$set(root.dir = normalizePath("."))
+```
+
+# Purpose of this stage
+
+This notebook is Stage 1 of the CostConformal-Return pipeline. It is the *only* stage that touches the raw ASOS GraphReturns files. Everything downstream — EDA, calibration, Conformal Risk Control, subgroup and drift audits — reads the outputs this stage writes to `data/processed/`, so correctness here matters more than anywhere else in the project.
+
+Stage 1 objectives (mapped to the proposal's Section 5):
+
+| Proposal section | What this stage does |
+|----|----|
+| 5.1 Loading & validation | Load the six official files, check shapes, duplicate keys, target validity |
+| 5.2 Table joining | Left-join customer and product features onto each purchase event, measure match rates |
+| 5.3 Leakage prevention | Exclude ambiguous return-reason columns, fit any statistic (medians, quantile caps) on training data only |
+| 5.4 Missing values | Flag rather than silently drop unmatched joins; leave imputation to the modelling stage's preprocessor |
+| 5.7 Feature engineering | Age bands, log-transformed counts, discount ratio, price-to-category-median, bounded value exposure |
+| 5.9 Data split strategy | 65/15/10/10 reproducible split of the *training* period into model-train / validation / CRC-calibration / IID-holdout; the official future-test period is left untouched |
+| 5.10 Preprocessing outputs | Processed CSVs, validation/audit/split tables, feature dictionary |
+
+By the end of this notebook you will have, on disk, everything Stage 1.5 (preprocessing), Stage 2 (EDA), and Stage 3 (calibration + CRC) need — and everything printed in this document is the actual output of your run, not a hard-coded example, so this file *is* your data-preparation report.
+
+# Before you render this document
+
+1.  Save this file as `01_data_preparation.qmd` in your project root — the **same folder** as `CostConformal-Return.Rproj` — not inside `R/`.
+
+2.  Confirm the six converted files already exist at:
+
+    ```         
+    data/raw_csv_gz/event_table_training.csv.gz
+    data/raw_csv_gz/event_table_testing.csv.gz
+    data/raw_csv_gz/customer_nodes_training.csv.gz
+    data/raw_csv_gz/customer_nodes_testing.csv.gz
+    data/raw_csv_gz/product_nodes_training.csv.gz
+    data/raw_csv_gz/product_nodes_testing.csv.gz
+    ```
+
+    (If you only have the original `.p` pickle files, run `stage1_convert_pickle_to_csv.py` once first.)
+
+3.  Open the `.Rproj` in RStudio, then **Render** this document (`Ctrl/Cmd+Shift+K`), or run it chunk-by-chunk interactively while you read along.
+
+# Setup and helper functions
+
+We reuse the shared helpers from `R/00_setup.R` (package loading, `read_csv_gz()`, `save_plot()`, Wilson confidence intervals, AUC/PR-AUC/log-loss/Brier helpers) so that every stage uses identical, tested primitives.
+
+```{r source-setup}
+source(file.path("R", "00_setup.R"))
+```
+
+# Loading the six official files
+
+We load only the columns the strict, leakage-safe design actually uses. Identifier columns (`hash(customerId)`, `hash(variantID)`) are read as **text**, never as numeric — a 64-bit hash stored as a double would silently lose precision and corrupt every downstream join.
+
+```{r raw-file-paths}
+raw_files <- c(
+  event_train    = file.path(RAW_DIR, "event_table_training.csv.gz"),
+  event_test     = file.path(RAW_DIR, "event_table_testing.csv.gz"),
+  customer_train = file.path(RAW_DIR, "customer_nodes_training.csv.gz"),
+  customer_test  = file.path(RAW_DIR, "customer_nodes_testing.csv.gz"),
+  product_train  = file.path(RAW_DIR, "product_nodes_training.csv.gz"),
+  product_test   = file.path(RAW_DIR, "product_nodes_testing.csv.gz")
+)
+assert_files_exist(raw_files)
+```
+
+```{r column-selection}
+# Return-reason ratio columns are deliberately excluded here, at the source.
+# Both node tables contain duplicated header names (e.g. "*_level_return_code_D")
+# that map to different underlying values once converted, so their semantic
+# meaning cannot be verified safely -- see Section 5.3 (Leakage Prevention)
+# below for the full justification.
+customer_columns <- c(
+  "hash(customerId)", "yearOfBirth", "isMale", "shippingCountry", "premier",
+  "salesPerCustomer", "returnsPerCustomer", "customerReturnRate"
+)
+
+product_columns <- c(
+  "hash(variantID)", "productType", "brandDesc", "avgGbpPrice",
+  "avgDiscountValue", "salesPerProduct", "returnsPerProduct",
+  "productReturnRate"
+)
+```
+
+```{r load-events}
+message("Loading official event tables...")
+event_train <- read_csv_gz(
+  raw_files[["event_train"]],
+  id_columns = c("hash(variantID)", "hash(customerId)")
+)
+event_test <- read_csv_gz(
+  raw_files[["event_test"]],
+  id_columns = c("hash(variantID)", "hash(customerId)")
+)
+```
+
+```{r load-customers}
+message("Loading strict customer features...")
+customer_train <- read_csv_gz(
+  raw_files[["customer_train"]],
+  id_columns = "hash(customerId)",
+  select = customer_columns
+)
+customer_test <- read_csv_gz(
+  raw_files[["customer_test"]],
+  id_columns = "hash(customerId)",
+  select = customer_columns
+)
+```
+
+```{r load-products}
+message("Loading strict product features...")
+product_train <- read_csv_gz(
+  raw_files[["product_train"]],
+  id_columns = "hash(variantID)",
+  select = product_columns
+)
+product_test <- read_csv_gz(
+  raw_files[["product_test"]],
+  id_columns = "hash(variantID)",
+  select = product_columns
+)
+```
+
+```{r rename-keys}
+setnames(
+  event_train,
+  c("hash(variantID)", "hash(customerId)"),
+  c("variant_id", "customer_id")
+)
+
+setnames(
+  event_test,
+  c("hash(variantID)", "hash(customerId)"),
+  c("variant_id", "customer_id")
+)
+
+setnames(
+  customer_train,
+  "hash(customerId)",
+  "customer_id"
+)
+
+setnames(
+  customer_test,
+  "hash(customerId)",
+  "customer_id"
+)
+
+setnames(
+  product_train,
+  "hash(variantID)",
+  "variant_id"
+)
+
+setnames(
+  product_test,
+  "hash(variantID)",
+  "variant_id"
+)
+```
+
+# Dataset validation
+
+Before anything is joined or modelled, we confirm the raw files match what the official benchmark documentation claims, and that the target and keys are well-formed. A `stop()` here is intentional — it is cheaper to fail loudly now than to silently model a corrupted table.
+
+```{r validation-summary}
+validation_summary <- rbindlist(list(
+  data.table(
+    split = "official_training",
+    event_rows = nrow(event_train),
+    customers = uniqueN(event_train$customer_id),
+    variants = uniqueN(event_train$variant_id),
+    return_count = sum(event_train$isReturned == 1L),
+    retained_count = sum(event_train$isReturned == 0L),
+    return_rate = mean(event_train$isReturned),
+    repeated_triplets = sum(duplicated(event_train))
+  ),
+  data.table(
+    split = "official_future_test",
+    event_rows = nrow(event_test),
+    customers = uniqueN(event_test$customer_id),
+    variants = uniqueN(event_test$variant_id),
+    return_count = sum(event_test$isReturned == 1L),
+    retained_count = sum(event_test$isReturned == 0L),
+    return_rate = mean(event_test$isReturned),
+    repeated_triplets = sum(duplicated(event_test))
+  )
+))
+```
+
+```{r hard-checks}
+if (!all(event_train$isReturned %in% c(0L, 1L)) ||
+    !all(event_test$isReturned %in% c(0L, 1L))) {
+  stop("The target contains values other than 0 and 1.")
+}
+if (anyDuplicated(customer_train$customer_id) > 0L ||
+    anyDuplicated(customer_test$customer_id) > 0L) {
+  stop("Duplicate customer node keys were detected.")
+}
+if (anyDuplicated(product_train$variant_id) > 0L ||
+    anyDuplicated(product_test$variant_id) > 0L) {
+  stop("Duplicate product-variant node keys were detected.")
+}
+```
+
+::: callout-note
+**Repeated (customer, variant, label) triplets are reported, not removed.** The public event tables carry no event ID or timestamp, so there is no principled way to tell a genuine repeat purchase apart from an accidental duplicate row. Deleting them would be an unjustified assumption dressed up as data cleaning — so they stay, and their count is logged in `validation_summary` below for transparency.
+:::
+
+```{r show-validation-summary}
+validation_summary
+```
+
+If your run reproduces the reference numbers, you should see **\~55.3%** training return rate and **\~54.5%** future-test return rate, with a handful of thousand repeated triplets in each split. Remember the dataset's selection-bias caveat: every customer in this release has at least one return, so these rates describe the *benchmark sample*, not the true ASOS-wide return prevalence — don't generalize this number in your report without that caveat attached.
+
+# Leakage-safe joins
+
+Customer and product features are attached to each purchase event with **left joins**, keyed on the hashed identifiers. A left join is the correct choice here: an inner join would silently drop every event whose customer or product node is missing from the corresponding node table, and — as you're about to see — that is not a negligible fraction of the data.
+
+```{r join-keys}
+setkey(customer_train, customer_id)
+setkey(customer_test, customer_id)
+setkey(product_train, variant_id)
+setkey(product_test, variant_id)
+
+customer_train[, customer_node_found := 1L]
+customer_test[, customer_node_found := 1L]
+product_train[, product_node_found := 1L]
+product_test[, product_node_found := 1L]
+```
+
+```{r do-joins}
+message("Joining official training events...")
+train_dt <- customer_train[event_train, on = "customer_id"]
+train_dt <- product_train[train_dt, on = "variant_id"]
+
+message("Joining official future-period events...")
+test_dt <- customer_test[event_test, on = "customer_id"]
+test_dt <- product_test[test_dt, on = "variant_id"]
+
+train_dt[, customer_node_found := fifelse(is.na(customer_node_found), 0L, 1L)]
+train_dt[, product_node_found := fifelse(is.na(product_node_found), 0L, 1L)]
+test_dt[, customer_node_found := fifelse(is.na(customer_node_found), 0L, 1L)]
+test_dt[, product_node_found := fifelse(is.na(product_node_found), 0L, 1L)]
+```
+
+```{r join-audit}
+join_audit <- rbindlist(list(
+  train_dt[, .(
+    split = "official_training",
+    rows = .N,
+    customer_match_rate = mean(customer_node_found),
+    product_match_rate = mean(product_node_found),
+    complete_match_rate = mean(customer_node_found == 1L & product_node_found == 1L)
+  )],
+  test_dt[, .(
+    split = "official_future_test",
+    rows = .N,
+    customer_match_rate = mean(customer_node_found),
+    product_match_rate = mean(product_node_found),
+    complete_match_rate = mean(customer_node_found == 1L & product_node_found == 1L)
+  )]
+))
+join_audit
+```
+
+::: callout-warning
+**Expect customer-match rates around \~95% but product-match rates only around \~65–69%.** Roughly a third of purchase events reference a variant hash absent from the product node table for that split. This is retained via the left join and flagged with `product_node_found`/`customer_node_found` indicators rather than dropped — an inner join here would have quietly discarded \~35–40% of your training data, which is exactly the kind of silent data loss the proposal's leakage/robustness sections warn against.
+:::
+
+# Feature engineering (leakage-safe)
+
+All engineered features below use only information available at or before the purchase decision. Category levels and reference statistics (product-type medians, the price cap) are computed **from the training split only** and then applied unchanged to the future-test split — never the other way around.
+
+```{r feature-function}
+# Purchase periods are in 2021, so age is computed relative to 2021.
+# Implausible ages (outside a sane 16-100 range) become NA and are handled
+# by the modelling-stage preprocessor rather than silently clipped here.
+add_basic_features <- function(dt) {
+  dt[, age := 2021L - yearOfBirth]
+  dt[age < 16L | age > 100L, age := NA_real_]
+  dt[, age_band := as.character(cut(
+    age,
+    breaks = c(16, 24, 34, 44, 54, 64, 100),
+    include.lowest = TRUE,
+    right = TRUE,
+    labels = c("16-24", "25-34", "35-44", "45-54", "55-64", "65+")
+  ))]
+  dt[is.na(age_band), age_band := "UNKNOWN"]
+
+  dt[, log_sales_customer := log1p(salesPerCustomer)]
+  dt[, log_returns_customer := log1p(returnsPerCustomer)]
+  dt[, log_sales_product := log1p(salesPerProduct)]
+  dt[, log_returns_product := log1p(returnsPerProduct)]
+
+  # Selling price plus discount value approximates the original (pre-discount) price.
+  dt[, discount_ratio := fifelse(
+    !is.na(avgGbpPrice) & !is.na(avgDiscountValue) &
+      (avgGbpPrice + avgDiscountValue) > 0,
+    avgDiscountValue / (avgGbpPrice + avgDiscountValue),
+    NA_real_
+  )]
+
+  dt[, customer_missing := as.integer(customer_node_found == 0L)]
+  dt[, product_missing := as.integer(product_node_found == 0L)]
+  dt[, missingness_count := rowSums(is.na(.SD)), .SDcols = c(
+    "age", "shippingCountry", "salesPerCustomer", "returnsPerCustomer",
+    "customerReturnRate", "productType", "brandDesc", "avgGbpPrice",
+    "avgDiscountValue", "salesPerProduct", "returnsPerProduct",
+    "productReturnRate"
+  )]
+  invisible(dt)
+}
+
+add_basic_features(train_dt)
+add_basic_features(test_dt)
+```
+
+## Category-relative price features
+
+`price_to_type_median` lets the model see whether an item is expensive *for its category*, not just expensive in absolute terms. The medians themselves are a training-only statistic:
+
+```{r type-medians}
+type_medians <- train_dt[
+  !is.na(productType) & !is.na(avgGbpPrice),
+  .(type_median_price = median(avgGbpPrice)),
+  by = productType
+]
+setkey(type_medians, productType)
+train_dt <- type_medians[train_dt, on = "productType"]
+test_dt <- type_medians[test_dt, on = "productType"]
+
+train_dt[, price_to_type_median := fifelse(
+  !is.na(avgGbpPrice) & !is.na(type_median_price) & type_median_price > 0,
+  avgGbpPrice / type_median_price,
+  NA_real_
+)]
+test_dt[, price_to_type_median := fifelse(
+  !is.na(avgGbpPrice) & !is.na(type_median_price) & type_median_price > 0,
+  avgGbpPrice / type_median_price,
+  NA_real_
+)]
+
+type_medians[order(productType)]
+```
+
+## Bounded value exposure (for later CRC use)
+
+The value-weighted missed-return loss used in Stage 3 needs a bounded exposure in $[0,1]$, not a raw price. We cap at the **event-level** (purchase-weighted) 95th percentile of training price — deliberately *not* the unique-product-catalog percentile, because the CRC loss is defined over purchase events, and a purchase-weighted cap is the statistic that actually matches that loss.
+
+```{r price-cap}
+price_cap_95 <- train_dt[!is.na(avgGbpPrice), quantile(avgGbpPrice, 0.95, names = FALSE)]
+if (!is.finite(price_cap_95) || price_cap_95 <= 0) {
+  stop("Could not calculate a valid training price cap.")
+}
+
+train_dt[, value_exposure := fifelse(
+  !is.na(avgGbpPrice) & avgGbpPrice > 0,
+  pmin(avgGbpPrice / price_cap_95, 1),
+  NA_real_
+)]
+test_dt[, value_exposure := fifelse(
+  !is.na(avgGbpPrice) & avgGbpPrice > 0,
+  pmin(avgGbpPrice / price_cap_95, 1),
+  NA_real_
+)]
+
+cat("Training event-level price cap (95th percentile): GBP", round(price_cap_95, 2), "\n")
+```
+
+Rows without a valid price remain fully usable for classification metrics; they are simply excluded from value-weighted policy/CRC evaluation later, since `value_exposure` is `NA` for them.
+
+# Reproducible data splits
+
+The **official training period only** is split reproducibly into four disjoint sets, stratified by the target so every split keeps the same \~55% return rate. The **official future-test period is never touched** here or in any later stage until the final robustness audit.
+
+```{r splits}
+set.seed(20260731)
+train_dt[, split_random := runif(.N), by = isReturned]
+train_dt[, analysis_split := fcase(
+  split_random < 0.65, "model_train",
+  split_random < 0.80, "validation",
+  split_random < 0.90, "crc_calibration",
+  default = "iid_holdout"
+)]
+train_dt[, split_random := NULL]
+
+split_summary <- train_dt[, .(
+  rows = .N,
+  returned = sum(isReturned == 1L),
+  retained = sum(isReturned == 0L),
+  return_rate = mean(isReturned),
+  price_available_rate = mean(!is.na(value_exposure))
+), by = analysis_split][order(match(
+  analysis_split,
+  c("model_train", "validation", "crc_calibration", "iid_holdout")
+))]
+
+split_summary
+```
+
+| Split | Role |
+|----|----|
+| `model_train` (\~65%) | Fits Logistic Regression / LightGBM and the preprocessing transforms |
+| `validation` (\~15%) | Hyperparameter tuning + choosing raw vs. Platt vs. isotonic calibration |
+| `crc_calibration` (\~10%) | Selects the risk-controlled threshold — **never used to fit the base model** |
+| `iid_holdout` (\~10%) | Evaluates the formal CRC guarantee under an exchangeable held-out setting |
+| `official_future_test` (untouched) | Temporal robustness / drift audit only |
+
+If `return_rate` is not stable at \~55% across every row of `split_summary`, stop and investigate before proceeding — that would indicate a bug in the split logic (e.g. an unintended join fan-out) rather than genuine variability.
+
+# Writing processed outputs
+
+```{r strict-columns}
+strict_columns <- c(
+  "variant_id", "customer_id", "isReturned", "analysis_split",
+  "customer_node_found", "product_node_found",
+  "yearOfBirth", "age", "age_band", "isMale", "shippingCountry", "premier",
+  "salesPerCustomer", "returnsPerCustomer", "customerReturnRate",
+  "log_sales_customer", "log_returns_customer",
+  "productType", "brandDesc", "avgGbpPrice", "avgDiscountValue",
+  "salesPerProduct", "returnsPerProduct", "productReturnRate",
+  "log_sales_product", "log_returns_product", "discount_ratio",
+  "type_median_price", "price_to_type_median", "value_exposure",
+  "customer_missing", "product_missing", "missingness_count"
+)
+
+future_columns <- setdiff(strict_columns, "analysis_split")
+train_strict <- train_dt[, ..strict_columns]
+future_strict <- test_dt[, ..future_columns]
+future_strict[, analysis_split := "official_future_test"]
+setcolorder(future_strict, strict_columns)
+```
+
+```{r write-processed}
+message("Writing processed datasets...")
+fwrite(
+  train_strict,
+  file.path(PROCESSED_DIR, "official_training_strict.csv.gz"),
+  compress = "gzip",
+  logical01 = TRUE
+)
+fwrite(
+  future_strict,
+  file.path(PROCESSED_DIR, "official_future_test_strict.csv.gz"),
+  compress = "gzip",
+  logical01 = TRUE
+)
+
+for (split_name in c("model_train", "validation", "crc_calibration", "iid_holdout")) {
+  fwrite(
+    train_strict[analysis_split == split_name],
+    file.path(PROCESSED_DIR, paste0(split_name, ".csv.gz")),
+    compress = "gzip",
+    logical01 = TRUE
+  )
+}
+```
+
+# Audit tables and feature dictionary
+
+These are the tables that Stage 2 (EDA) and your written report both pull numbers from — writing them here means the report and the code can never drift out of sync.
+
+```{r write-tables}
+fwrite(validation_summary, file.path(TABLE_DIR, "01_dataset_validation_summary.csv"))
+fwrite(join_audit, file.path(TABLE_DIR, "02_join_audit.csv"))
+fwrite(split_summary, file.path(TABLE_DIR, "03_split_summary.csv"))
+fwrite(
+  data.table(
+    parameter = c("price_cap_quantile", "event_level_training_price_cap_gbp"),
+    value = c(0.95, price_cap_95)
+  ),
+  file.path(TABLE_DIR, "04_exposure_parameters.csv")
+)
+fwrite(type_medians, file.path(TABLE_DIR, "05_training_product_type_medians.csv"))
+
+feature_dictionary <- data.table(
+  feature = strict_columns,
+  role = fifelse(
+    strict_columns %in% c("variant_id", "customer_id"), "join/audit identifier",
+    fifelse(strict_columns == "isReturned", "target",
+      fifelse(strict_columns == "analysis_split", "split label",
+        fifelse(strict_columns == "value_exposure", "bounded policy exposure", "predictive/audit feature")
+      )
+    )
+  )
+)
+fwrite(feature_dictionary, file.path(TABLE_DIR, "06_feature_dictionary.csv"))
+
+feature_dictionary
+```
+
+# What was explicitly excluded, and why
+
+| Excluded | Reason |
+|----|----|
+| `*_level_return_code_D` return-reason columns (both customer and product tables) | Duplicated header names map to different underlying values once converted; the semantic mapping cannot be verified safely |
+| `cluster_id`-style identifiers as numeric predictors | Would leak the real product/customer grouping |
+| Any statistic computed from future or current-event outcomes | Direct target leakage |
+| Test-period statistics used during training | Violates the training/calibration/test separation the whole CRC argument depends on |
+| Raw hashed IDs as numeric features | Meaningless as numbers; kept only as join/audit keys |
+
+# Stage 1 checklist — confirm before moving on
+
+- [ ] `validation_summary` shows return rates ≈55.3% (training) / ≈54.5% (future test)
+- [ ] No `stop()` was triggered by the hard checks above
+- [ ] `join_audit` shows customer match ≈95%, product match ≈65–69% for both splits
+- [ ] `split_summary` shows four training-period splits with return rate stable at ≈55%
+- [ ] `data/processed/` now contains 6 files: `official_training_strict.csv.gz`, `official_future_test_strict.csv.gz`, `model_train.csv.gz`, `validation.csv.gz`, `crc_calibration.csv.gz`, `iid_holdout.csv.gz`
+- [ ] `outputs/tables/` now contains `01_dataset_validation_summary.csv` through `06_feature_dictionary.csv`
+
+Once every box is checked, you're ready for **Stage 1.5 (`01b_preprocessing.qmd`)** — missing-value imputation, categorical encoding, and normalization — followed by **Stage 2 (`02_eda_visualizations.qmd`)** and **Stage 3** (baseline model, calibration, and Conformal Risk Control).
+
+```{r session-info}
+sessionInfo()
+```

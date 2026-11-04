@@ -1,0 +1,498 @@
+---
+title: "CostConformal-Return — Stage 10: Statistical Analysis of the Final Policy Comparison"
+subtitle: "Category-Aware and Future-Period Drift-Audited Conformal Risk Control for Value-Sensitive E-Commerce Returns"
+author: "Simran Kumari (24BDS1031)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    df-print: kable
+    theme: cosmo
+execute:
+  warning: false
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath("."))
+```
+
+# Purpose of this stage
+
+Stage 9 produced point estimates of value-weighted CRC risk and intervention rate for both selected models (XGBoost, Elastic-Net), at every alpha, on `iid_holdout` and `future_test`. Point estimates alone don't tell you whether one model's number being lower is a real effect or sampling noise. This stage quantifies that, using the same paired-bootstrap approach Stage 8 already established for the AUC comparison: resample rows once per replicate, score both models on the identical resample, so the comparison controls for shared sampling variance rather than treating each model's uncertainty as independent.
+
+What this adds, concretely:
+
+- A 95% bootstrap CI on the **risk difference** (XGBoost minus Elastic-Net) at every alpha, on both `iid_holdout` and `future_test`.
+- A 95% bootstrap CI on the **intervention-rate difference**, same structure, on both splits.
+- Closed-form **Wilson CIs** on each model's intervention rate itself (a proportion, so Wilson is the more defensible interval than a normal approximation at these sample sizes) -- reusing `wilson_ci()` from `00_setup.R` directly, not reimplementing it.
+- An explicit **significance verdict** per alpha per split: whether 0 falls inside the bootstrapped CI of the difference.
+
+Thresholds (tau) are fixed at the values Stage 9 already selected on `crc_calibration` -- this stage resamples the evaluation rows only, not the threshold-selection process. That is deliberate: it answers "given this policy, how uncertain is our estimate of its risk/workload on fresh data," which is the question a final report needs, not "how would the threshold itself vary under resampling" (a different, noisier question Stage 9's CRC guarantee already handles formally for the calibration side).
+
+## Scoring must match Stage 9 exactly
+
+The calibrators saved by Stage 9 were fit on the raw probabilities produced by Stage 9's scorers. This stage therefore uses the **same** scorers, copied verbatim: the XGBoost booster is loaded from `xgboost_tuned.ubj` (never from the `.rds` Booster, whose external pointer is stale across sessions), its trees are read out and scored in pure R, and its design matrix is built from the booster's own feature names. See Stage 9 for why xgboost's native predict cannot be used on this machine.
+
+## Before you render this document
+
+1.  Save this file as `10_statistical_analysis.qmd` in the project root.
+2.  Confirm Stage 9's checklist is fully green -- `models/phase3_crc/r_calibrators.rds`, `models/r_phase3_registry.rds`, and `outputs/tables/p3_02_global_crc_thresholds.csv` must exist.
+3.  Render with Ctrl/Cmd+Shift+K, or run chunk-by-chunk. Scoring `future_test` in pure R takes a few minutes per model.
+
+# Setup
+
+```{r source-setup}
+source(file.path("R", "00_setup.R"))
+data.table::setDTthreads(2)
+
+required_packages <- c("DBI", "RSQLite", "glmnet", "xgboost")
+missing_packages <- setdiff(required_packages, rownames(installed.packages()))
+if (length(missing_packages) > 0) install.packages(missing_packages)
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+N_BOOT <- 200  # same as Stage 8, for methodological consistency across the project's bootstrap-based analyses
+set.seed(20260917)
+PRED_CHUNK_SIZE <- 50000
+
+P3_DIR <- file.path(MODEL_DIR, "phase3_crc")
+DB_PATH <- file.path("data", "costconformal_return.sqlite")
+```
+
+```{r load-metadata}
+preprocessor <- readRDS(file.path(MODEL_DIR, "r_preprocessor.rds"))
+feature_selector <- readRDS(file.path(MODEL_DIR, "r_feature_selector.rds"))
+registry <- readRDS(file.path(MODEL_DIR, "r_final_model_registry.rds"))
+calibrators <- readRDS(file.path(P3_DIR, "r_calibrators.rds"))
+global_crc_results <- fread(file.path(TABLE_DIR, "p3_02_global_crc_thresholds.csv"))
+
+bin_label_levels <- function(fs) {
+  bd <- fs$bin_definitions
+  list(
+    price_tier = c("Q1_low", "Q2", "Q3", "Q4_high")[seq_len(length(bd$price_breaks) - 1)],
+    customer_risk_tier = c("Low", "Mid", "High")[seq_len(length(bd$risk_breaks) - 1)]
+  )
+}
+BIN_LEVELS <- bin_label_levels(feature_selector)
+
+load_split_from_db <- function(con, split_name, preprocessor, feature_selector, bin_levels) {
+  dt <- as.data.table(DBI::dbGetQuery(con, paste0("SELECT * FROM ", split_name)))
+  for (col in feature_selector$categorical_features) {
+    if (col %in% names(dt)) {
+      levs <- union(preprocessor$allowed_levels[[col]], "OTHER")
+      set(dt, j = col, value = factor(dt[[col]], levels = levs))
+    }
+  }
+  for (col in names(bin_levels)) {
+    if (col %in% names(dt)) set(dt, j = col, value = factor(dt[[col]], levels = bin_levels[[col]]))
+  }
+  dt
+}
+```
+
+## Model scorers (identical to Stage 9)
+
+```{r scorers}
+build_onehot <- function(dt, predictors) {
+  model.matrix(as.formula(paste("~", paste(predictors, collapse = " + "), "- 1")), data = dt)
+}
+
+# Pads any training columns missing from x with zeros and reorders to the
+# training column order. Always returns a plain matrix (never a data.frame).
+align_onehot <- function(x, train_colnames) {
+  x <- as.matrix(x)
+  missing_cols <- setdiff(train_colnames, colnames(x))
+  if (length(missing_cols) > 0) {
+    add <- matrix(0, nrow = nrow(x), ncol = length(missing_cols),
+                  dimnames = list(NULL, missing_cols))
+    x <- cbind(x, add)
+  }
+  x[, train_colnames, drop = FALSE]
+}
+
+# ---- Pure-R scoring of an xgboost booster -------------------------------------
+xgb_extract_trees <- function(booster, wrapper_colnames = NULL) {
+  dt <- as.data.table(xgboost::xgb.model.dt.tree(model = booster))
+  leaf_col <- if ("Gain" %in% names(dt)) "Gain" else "Quality"
+  feat_chr <- as.character(dt$Feature)
+  split_feats <- unique(feat_chr[feat_chr != "Leaf"])
+
+  unnamed <- all(grepl("^f[0-9]+$", split_feats)) &&
+    !is.null(wrapper_colnames) && !all(split_feats %in% wrapper_colnames)
+  if (unnamed) {
+    feat_names <- wrapper_colnames
+    fidx <- as.integer(sub("^f", "", feat_chr)) + 1L
+  } else {
+    feat_names <- split_feats
+    fidx <- match(feat_chr, feat_names)
+  }
+  fidx[feat_chr == "Leaf"] <- 0L
+
+  trees <- lapply(split(seq_len(nrow(dt)), dt$Tree), function(rows) {
+    d <- dt[rows]; fi <- fidx[rows]
+    o <- order(d$Node); d <- d[o]; fi <- fi[o]
+    stopifnot(identical(as.integer(d$Node), seq_len(nrow(d)) - 1L))
+    list(feat  = as.integer(fi),
+         split = as.numeric(d$Split),
+         yes   = match(d$Yes, d$ID) - 1L,
+         no    = match(d$No,  d$ID) - 1L,
+         value = as.numeric(d[[leaf_col]]))
+  })
+  list(trees = trees, feat_names = feat_names)
+}
+
+xgb_base_margin <- function(booster) {
+  bs <- tryCatch({
+    cfg <- xgboost::xgb.config(booster)
+    v <- NULL
+    if (is.list(cfg)) v <- cfg$learner$learner_model_param$base_score
+    if (is.null(v) && is.character(cfg))
+      v <- sub('.*"base_score"\\s*:\\s*"([^"]+)".*', "\\1", cfg)
+    as.numeric(gsub("[][]", "", v))[1]
+  }, error = function(e) NA_real_)
+  if (is.na(bs)) {
+    warning("Could not read base_score from the booster config; assuming 0.5.")
+    bs <- 0.5
+  }
+  qlogis(bs)
+}
+
+# Splits are "go to Yes branch if value < Split", as in xgboost.
+xgb_predict_trees <- function(fit, x) {
+  if (anyNA(x)) stop("NA in model matrix; tree scorer does not handle missing values.")
+  n <- nrow(x)
+  margin <- rep(fit$base_margin, n)
+  for (tr in fit$trees) {
+    pos <- rep.int(0L, n)
+    repeat {
+      f <- tr$feat[pos + 1L]
+      act <- which(f > 0L)
+      if (length(act) == 0L) break
+      xv <- x[cbind(act, f[act])]
+      p <- pos[act] + 1L
+      pos[act] <- ifelse(xv < tr$split[p], tr$yes[p], tr$no[p])
+    }
+    margin <- margin + tr$value[pos + 1L]
+  }
+  plogis(margin)
+}
+
+# ---- Design matrix built from the booster's OWN feature names ------------------
+resolve_design_spec <- function(dt, feat_names) {
+  vars <- names(dt)
+  spec <- lapply(feat_names, function(f) {
+    if (f %in% vars && (is.numeric(dt[[f]]) || is.logical(dt[[f]])))
+      return(list(name = f, var = f, level = NULL))
+    cand <- vars[startsWith(f, vars) & nchar(f) > nchar(vars)]
+    if (length(cand) == 0) return(list(name = f, var = NA_character_, level = NULL))
+    v <- cand[which.max(nchar(cand))]
+    list(name = f, var = v, level = substring(f, nchar(v) + 1L))
+  })
+  unresolved <- feat_names[vapply(spec, function(z) is.na(z$var), logical(1))]
+  if (length(unresolved) > 0) {
+    stop(length(unresolved), " booster feature(s) cannot be built from the data columns: ",
+         paste(head(unresolved, 8), collapse = ", "))
+  }
+  spec
+}
+
+build_design <- function(dt, spec) {
+  x <- matrix(0, nrow = nrow(dt), ncol = length(spec),
+              dimnames = list(NULL, vapply(spec, function(z) z$name, character(1))))
+  for (j in seq_along(spec)) {
+    z <- spec[[j]]
+    col <- dt[[z$var]]
+    x[, j] <- if (is.null(z$level)) as.numeric(col) else as.numeric(as.character(col) %in% z$level)
+  }
+  x
+}
+
+load_xgb_robust <- function(entry) {
+  # Metadata from the RDS wrapper; its Booster is NOT used (stale external pointer).
+  wrapper <- readRDS(entry$model_path)
+  predictors <- wrapper$predictors
+  wrapper_colnames <- wrapper$train_colnames
+  rm(wrapper)
+
+  booster <- xgboost::xgb.load(entry$xgb_ubj_path)
+  ex <- xgb_extract_trees(booster, wrapper_colnames)
+  base_margin <- xgb_base_margin(booster)
+  cat("xgboost booster loaded from .ubj: ", length(ex$trees), " trees, ",
+      length(ex$feat_names), " split features, base_score = ",
+      round(plogis(base_margin), 5), ".\n", sep = "")
+
+  list(model = booster, trees = ex$trees, base_margin = base_margin,
+       predictors = predictors, train_colnames = ex$feat_names)
+}
+
+predict_xgboost <- function(fit, newdata, chunk_size = PRED_CHUNK_SIZE) {
+  n <- nrow(newdata)
+  spec <- resolve_design_spec(newdata, fit$train_colnames)
+  out <- numeric(n)
+  for (s in seq(1, n, by = chunk_size)) {
+    e <- min(s + chunk_size - 1, n)
+    out[s:e] <- xgb_predict_trees(fit, build_design(newdata[s:e], spec))
+  }
+  out
+}
+
+predict_glmnet_selected <- function(fit, newdata, chunk_size = PRED_CHUNK_SIZE) {
+  n <- nrow(newdata)
+  out <- numeric(n)
+  for (s in seq(1, n, by = chunk_size)) {
+    e <- min(s + chunk_size - 1, n)
+    x <- align_onehot(build_onehot(newdata[s:e], fit$predictors), fit$train_colnames)
+    out[s:e] <- as.numeric(predict(fit$model, newx = x, s = fit$lambda, type = "response"))
+  }
+  out
+}
+
+registry_by_id <- setNames(registry$models, sapply(registry$models, `[[`, "model_id"))
+xgb_fit <- load_xgb_robust(registry_by_id$xgboost)
+en_fit  <- readRDS(registry_by_id$elastic_net_logistic$model_path)
+
+SELECTED_MODELS <- list(
+  xgboost = list(label = "XGBoost", fit = xgb_fit, predict_fn = predict_xgboost),
+  elastic_net_logistic = list(label = "Elastic-Net", fit = en_fit, predict_fn = predict_glmnet_selected)
+)
+ALPHA_GRID <- unique(global_crc_results$alpha)
+```
+
+```{r calibrator-helpers}
+# The calibrators saved by Stage 9 are closures: they hold the fitted Platt
+# model / isotonic step function, but call these two helpers BY NAME, and
+# saveRDS() does not store functions that live in the global environment.
+# They must therefore be defined here, identically to Stage 9.
+predict_platt <- function(platt_model, raw_prob) {
+  logit_p <- qlogis(pmin(pmax(raw_prob, 1e-6), 1 - 1e-6))
+  as.numeric(predict(platt_model, newdata = data.frame(logit_p = logit_p), type = "response"))
+}
+predict_isotonic <- function(iso_step, raw_prob) pmin(pmax(iso_step(raw_prob), 0), 1)
+
+# Quick self-check that every saved calibrator runs and returns valid probabilities.
+for (id in names(calibrators)) {
+  test_p <- calibrators[[id]]$predict_fn(c(0.05, 0.3, 0.5, 0.8))
+  stopifnot(length(test_p) == 4, all(is.finite(test_p)), all(test_p >= 0 & test_p <= 1))
+  cat("Calibrator for", id, "(", calibrators[[id]]$method, ") OK.\n")
+}
+```
+
+```{r helpers}
+# Paired bootstrap on PRE-COMPUTED per-row vectors: one set of resampled row
+# indices per replicate is applied to both models' vectors, so the comparison
+# controls for shared sampling variance.
+paired_bootstrap_diff <- function(a_vec, b_vec, n_boot = N_BOOT) {
+  n <- length(a_vec)
+  diffs <- numeric(n_boot); vals_a <- numeric(n_boot); vals_b <- numeric(n_boot)
+  for (b in seq_len(n_boot)) {
+    idx <- sample.int(n, n, replace = TRUE)
+    va <- mean(a_vec[idx]); vb <- mean(b_vec[idx])
+    vals_a[b] <- va; vals_b[b] <- vb; diffs[b] <- va - vb
+  }
+  ci <- quantile(diffs, c(0.025, 0.975), names = FALSE)
+  data.table(mean_a = mean(vals_a), mean_b = mean(vals_b), mean_diff = mean(diffs),
+             diff_ci_low = ci[1], diff_ci_high = ci[2],
+             significant = (ci[1] > 0) || (ci[2] < 0))
+}
+
+# Risk and intervention-rate comparison, XGBoost (a) vs. Elastic-Net (b),
+# at every alpha, with tau fixed at the Stage 9 values.
+compare_models <- function(y, v, probs, split_name) {
+  rbindlist(lapply(ALPHA_GRID, function(a) {
+    tau_x <- global_crc_results[model_id == "xgboost" & alpha == a, tau]
+    tau_e <- global_crc_results[model_id == "elastic_net_logistic" & alpha == a, tau]
+
+    risk <- paired_bootstrap_diff(y * v * (probs$xgboost < tau_x),
+                                  y * v * (probs$elastic_net_logistic < tau_e))
+    risk[, `:=`(alpha = a, split = split_name, metric = "risk")]
+
+    interv <- paired_bootstrap_diff(as.numeric(probs$xgboost >= tau_x),
+                                    as.numeric(probs$elastic_net_logistic >= tau_e))
+    interv[, `:=`(alpha = a, split = split_name, metric = "intervention_rate")]
+
+    rbindlist(list(risk, interv))
+  }))[, `:=`(xgboost_value = mean_a, elastic_net_value = mean_b)]
+}
+```
+
+# Scoring both models on iid_holdout
+
+```{r score-holdout}
+con <- DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
+iid_holdout <- load_split_from_db(con, "iid_holdout", preprocessor, feature_selector, BIN_LEVELS)
+DBI::dbDisconnect(con)
+cat("iid_holdout:", nrow(iid_holdout), "rows.\n")
+
+holdout_probs <- lapply(names(SELECTED_MODELS), function(id) {
+  m <- SELECTED_MODELS[[id]]
+  raw <- m$predict_fn(m$fit, iid_holdout)
+  calibrators[[id]]$predict_fn(raw)
+})
+names(holdout_probs) <- names(SELECTED_MODELS)
+
+y_h <- iid_holdout$isReturned
+v_h <- iid_holdout$value_exposure
+```
+
+# Wilson confidence intervals on intervention rate (iid_holdout)
+
+```{r wilson-ci}
+wilson_results <- rbindlist(lapply(names(SELECTED_MODELS), function(id) {
+  rbindlist(lapply(ALPHA_GRID, function(a) {
+    tau <- global_crc_results[model_id == id & alpha == a, tau]
+    n_intervened <- sum(holdout_probs[[id]] >= tau)
+    n <- length(holdout_probs[[id]])
+    wci <- wilson_ci(n_intervened, n)
+    data.table(model_id = id, alpha = a, tau = tau, n_intervened = n_intervened, n = n,
+               rate = wci$p_hat, ci_low = wci$lower, ci_high = wci$upper)
+  }))
+}))
+fwrite(wilson_results, file.path(TABLE_DIR, "s10_01_wilson_ci_intervention_rate.csv"))
+wilson_results
+```
+
+# Paired bootstrap: risk and intervention-rate differences (iid_holdout)
+
+```{r bootstrap-holdout}
+holdout_bootstrap <- compare_models(y_h, v_h, holdout_probs, "iid_holdout")
+
+fwrite(holdout_bootstrap, file.path(TABLE_DIR, "s10_02_bootstrap_holdout_comparison.csv"))
+knitr::kable(holdout_bootstrap[, .(split, metric, alpha, xgboost_value, elastic_net_value, mean_diff, diff_ci_low, diff_ci_high, significant)], digits = 5)
+
+rm(iid_holdout, holdout_probs, y_h, v_h); invisible(gc(verbose = FALSE))
+```
+
+# Scoring both models on future_test
+
+Loaded once, both models scored, bootstrapped, freed -- same RAM discipline as every stage since Stage 4. (The file name `s10_03_bootstrap_future_risk_comparison.csv` is kept for compatibility with the Stage 10 checklist; it now holds both the risk and the intervention-rate comparison on `future_test`.)
+
+```{r score-and-bootstrap-future}
+con <- DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
+future_test <- load_split_from_db(con, "future_test", preprocessor, feature_selector, BIN_LEVELS)
+DBI::dbDisconnect(con)
+cat("future_test:", nrow(future_test), "rows.\n")
+
+future_probs <- lapply(names(SELECTED_MODELS), function(id) {
+  m <- SELECTED_MODELS[[id]]
+  raw <- m$predict_fn(m$fit, future_test)
+  p <- calibrators[[id]]$predict_fn(raw)
+  invisible(gc(verbose = FALSE))
+  p
+})
+names(future_probs) <- names(SELECTED_MODELS)
+
+y_f <- future_test$isReturned
+v_f <- future_test$value_exposure
+rm(future_test); invisible(gc(verbose = FALSE))
+
+future_bootstrap <- compare_models(y_f, v_f, future_probs, "future_test")
+
+fwrite(future_bootstrap, file.path(TABLE_DIR, "s10_03_bootstrap_future_risk_comparison.csv"))
+knitr::kable(future_bootstrap[, .(split, metric, alpha, xgboost_value, elastic_net_value, mean_diff, diff_ci_low, diff_ci_high, significant)], digits = 5)
+
+rm(future_probs, y_f, v_f); invisible(gc(verbose = FALSE))
+```
+
+# Significance summary
+
+One row per alpha per split per metric: does the 95% CI of the XGBoost-minus-Elastic-Net difference exclude zero?
+
+```{r significance-summary}
+significance_summary <- rbindlist(list(holdout_bootstrap, future_bootstrap), fill = TRUE)[
+  , .(split, metric, alpha, xgboost_value, elastic_net_value, mean_diff, diff_ci_low, diff_ci_high, significant)
+]
+setorder(significance_summary, split, metric, alpha)
+fwrite(significance_summary, file.path(TABLE_DIR, "s10_04_significance_summary.csv"))
+significance_summary
+```
+
+# Figures
+
+```{r fig-holdout-risk-ci}
+#| fig-width: 8
+#| fig-height: 5
+plot_risk <- holdout_bootstrap[metric == "risk"]
+plot_risk_long <- rbindlist(list(
+  plot_risk[, .(alpha, model = "XGBoost", value = xgboost_value)],
+  plot_risk[, .(alpha, model = "Elastic-Net", value = elastic_net_value)]
+))
+p_holdout_risk <- ggplot(plot_risk_long, aes(x = factor(alpha), y = value, colour = model, group = model)) +
+  geom_point(size = 3, position = position_dodge(width = 0.3)) +
+  geom_line(position = position_dodge(width = 0.3)) +
+  labs(title = "Value-weighted CRC risk on iid_holdout, by alpha",
+       subtitle = "Point estimates; see s10_02 for the bootstrapped difference CI",
+       x = "Target risk level (alpha)", y = "Realized risk", colour = NULL) +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+ggsave(file.path(FIGURE_DIR, "s10_holdout_risk_comparison.png"), p_holdout_risk, width = 8, height = 5, dpi = 200)
+p_holdout_risk
+```
+
+```{r fig-diff-ci}
+#| fig-width: 8
+#| fig-height: 5
+diff_plot_dt <- copy(significance_summary)
+diff_plot_dt[, split_metric := paste(split, metric, sep = " / ")]
+p_diff <- ggplot(diff_plot_dt, aes(x = factor(alpha), y = mean_diff, colour = significant)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_pointrange(aes(ymin = diff_ci_low, ymax = diff_ci_high)) +
+  facet_wrap(~ split_metric, scales = "free_y") +
+  scale_colour_manual(values = c(`TRUE` = "#C44E52", `FALSE` = "grey50")) +
+  labs(title = "XGBoost minus Elastic-Net: 95% bootstrap CI of the difference",
+       subtitle = "Red = CI excludes zero (statistically significant at this alpha)",
+       x = "Target risk level (alpha)", y = "Difference (XGBoost - Elastic-Net)", colour = "Significant") +
+  theme_minimal(base_size = 10) + theme(legend.position = "bottom")
+ggsave(file.path(FIGURE_DIR, "s10_difference_ci.png"), p_diff, width = 8, height = 5, dpi = 200)
+p_diff
+```
+
+# Quality gate
+
+```{r quality-gate}
+cat("\n============================================================\nSTAGE 10 QUALITY GATE\n",
+    "============================================================\n\n", sep = "")
+GATE_PASS <- TRUE
+fail_check <- function(msg) { cat("FAIL:", msg, "\n"); GATE_PASS <<- FALSE }
+warn_check <- function(msg) cat("WARN:", msg, "\n")
+pass_check <- function(msg) cat("PASS:", msg, "\n")
+
+s10_tables <- c("s10_01_wilson_ci_intervention_rate", "s10_02_bootstrap_holdout_comparison",
+                "s10_03_bootstrap_future_risk_comparison", "s10_04_significance_summary")
+if (all(file.exists(file.path(TABLE_DIR, paste0(s10_tables, ".csv"))))) pass_check("All 4 Stage 10 tables written.") else fail_check("A Stage 10 table is missing.")
+
+s10_figs <- c("s10_holdout_risk_comparison", "s10_difference_ci")
+if (all(file.exists(file.path(FIGURE_DIR, paste0(s10_figs, ".png"))))) pass_check("Both Stage 10 figures written.") else fail_check("A Stage 10 figure is missing.")
+
+# 2 splits x 2 metrics (risk, intervention_rate) x alphas
+if (nrow(significance_summary) == length(ALPHA_GRID) * 4) pass_check("Significance summary covers every alpha x metric x split combination.") else warn_check("Significance summary row count looks off -- check for a dropped alpha.")
+
+n_sig <- sum(significance_summary$significant)
+cat("Significant differences found:", n_sig, "of", nrow(significance_summary), "alpha/metric/split combinations.\n")
+if (n_sig == 0) {
+  warn_check("No statistically significant difference found anywhere between XGBoost and Elastic-Net -- worth stating plainly in the final report rather than over-claiming XGBoost is 'better'.")
+} else {
+  pass_check(paste(n_sig, "statistically significant difference(s) found -- see s10_04 for which alpha/metric/split."))
+}
+
+if (!GATE_PASS) stop("Stage 10 quality gate failed -- see FAIL messages above.")
+cat("\nAll required checks passed.\n")
+```
+
+# Stage 10 checklist — confirm before moving on
+
+- [ ] `outputs/tables/s10_01_wilson_ci_intervention_rate.csv` through `s10_04_significance_summary.csv` all exist
+- [ ] `outputs/figures/s10_holdout_risk_comparison.png` and `s10_difference_ci.png` both exist
+- [ ] The console printed `xgboost booster loaded from .ubj: ... trees ...` (the scorer is the same as Stage 9's)
+- [ ] `s10_04_significance_summary.csv` reviewed row by row -- note which alpha/metric/split combinations are genuinely significant (CI excludes 0) vs. which are not; the final report should only claim "XGBoost is better" where this table actually supports it
+- [ ] If `n_sig == 0` printed, the final report's conclusion should say the two models are statistically indistinguishable on the CRC policy metrics at this sample size, not just report the point-estimate ranking from Stage 9
+- [ ] STAGE 10 QUALITY GATE passed before any file was written
+
+Stage 11 (final report) reads `s10_04_significance_summary.csv` directly to state the comparison honestly, rather than re-deriving it from point estimates alone.
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,301 @@
+---
+title: "CostConformal-Return — Stage 2: Exploratory Data Analysis"
+subtitle: "Category-Aware and Future-Period Drift-Audited Conformal Risk Control for Value-Sensitive E-Commerce Returns"
+author: "Simran Kumari (24BDS1031)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    df-print: kable
+    theme: cosmo
+execute:
+  warning: false
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath("."))
+```
+
+# Purpose of this stage
+
+This notebook is Stage 2 of the CostConformal-Return pipeline. It reads only the processed files written by Stage 1 (`data/processed/*.csv.gz`) — it never touches `data/raw_pickle/` or `data/raw_csv_gz/` — and produces the six exploratory figures and their backing tables described in Section 8 of the project report. Figures `06_value_exposure_and_intervention_by_threshold.png` and `07_calibration_curve.png` are deliberately **not** produced here: both depend on the fitted baseline model's calibrated probabilities and belong to Stage 3.
+
+Every number in this document is Wilson-CI-audited wherever a rate is plotted, using the same `wilson_ci()` helper from `R/00_setup.R` that Stage 1 sources.
+
+# Before you render this document
+
+1.  Save this file as `02_eda_visualizations.qmd` in the project root — the same folder as `CostConformal-Return.Rproj`.
+2.  Confirm Stage 1's checklist is fully green and that `data/processed/official_training_strict.csv.gz` and `data/processed/official_future_test_strict.csv.gz` both exist.
+3.  Render with `Ctrl/Cmd+Shift+K`, or run chunk-by-chunk.
+
+# Setup and data loading
+
+```{r source-setup}
+source(file.path("R", "00_setup.R"))
+```
+
+We use the **full official training period** (not just `model_train`) for EDA, matching how the report's reference numbers were computed — EDA describes the data, it doesn't leak into model fitting, so there's no reason to throw away 35% of the training rows here.
+
+```{r load-processed}
+processed_files <- c(
+  train = file.path(PROCESSED_DIR, "official_training_strict.csv.gz"),
+  future_test = file.path(PROCESSED_DIR, "official_future_test_strict.csv.gz")
+)
+assert_files_exist(processed_files)
+
+train_dt <- fread(processed_files[["train"]])
+future_dt <- fread(processed_files[["future_test"]])
+
+cat("Training rows:", nrow(train_dt), " | Future-test rows:", nrow(future_dt), "\n")
+```
+
+# 8.1 Return class distribution
+
+```{r class-distribution-table}
+class_dist <- train_dt[, .(
+  count = .N
+), by = isReturned][order(isReturned)]
+class_dist[, label := fifelse(isReturned == 1L, "Returned", "Retained")]
+class_dist[, pct := count / sum(count)]
+
+fwrite(class_dist, file.path(TABLE_DIR, "07_return_class_distribution.csv"))
+class_dist
+```
+
+```{r class-distribution-plot}
+p_class <- ggplot(class_dist, aes(x = label, y = count, fill = label)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = percent(pct, accuracy = 0.01)), vjust = -0.4) +
+  scale_y_continuous(labels = comma) +
+  scale_fill_manual(values = c("Retained" = "#4C72B0", "Returned" = "#C44E52")) +
+  labs(
+    title = "Return class distribution (official training period)",
+    x = NULL, y = "Events", fill = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+p_class
+save_plot(p_class, "01_return_class_distribution.png")
+```
+
+Close to balanced — accuracy alone is a legitimate but insufficient metric; PR-AUC, recall and the value-weighted metrics remain necessary downstream.
+
+# 8.2 Product price by return outcome
+
+Only rows with a valid joined price (`!is.na(avgGbpPrice)`) are included, consistent with how `value_exposure` is defined in Stage 1.
+
+```{r price-by-outcome-table}
+price_by_outcome <- train_dt[!is.na(avgGbpPrice), .(
+  events_with_price = .N,
+  mean_price = mean(avgGbpPrice),
+  median_price = median(avgGbpPrice),
+  p95_price = quantile(avgGbpPrice, 0.95, names = FALSE),
+  p99_price = quantile(avgGbpPrice, 0.99, names = FALSE)
+), by = isReturned][order(-isReturned)]
+price_by_outcome[, label := fifelse(isReturned == 1L, "Returned", "Retained")]
+
+fwrite(price_by_outcome, file.path(TABLE_DIR, "08_price_by_return_outcome.csv"))
+price_by_outcome
+```
+
+```{r price-by-outcome-plot}
+plot_dt <- train_dt[!is.na(avgGbpPrice)]
+plot_dt[, label := fifelse(isReturned == 1L, "Returned", "Retained")]
+
+p_price <- ggplot(plot_dt, aes(x = label, y = avgGbpPrice, fill = label)) +
+  geom_violin(alpha = 0.5, trim = TRUE) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, fill = "white") +
+  coord_cartesian(ylim = c(0, quantile(plot_dt$avgGbpPrice, 0.99, names = FALSE))) +
+  scale_fill_manual(values = c("Retained" = "#4C72B0", "Returned" = "#C44E52")) +
+  labs(
+    title = "Product price by return outcome",
+    subtitle = "Y-axis clipped at the 99th percentile for readability",
+    x = NULL, y = "Price (GBP)", fill = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+p_price
+save_plot(p_price, "02_product_price_by_return_outcome.png")
+```
+
+Returned items skew consistently higher across the whole distribution (mean, median, p95, p99 all higher), supporting the value-sensitive framing — but the heavy overlap between distributions means price alone cannot separate the classes.
+
+# 8.3 Return rate by product type (Wilson 95% CIs)
+
+```{r return-rate-by-type-table}
+by_type <- train_dt[!is.na(productType), .(
+  events = .N,
+  returns = sum(isReturned == 1L)
+), by = productType]
+
+by_type[, c("return_rate", "ci_lower", "ci_upper") := {
+  ci <- Map(wilson_ci, returns, events)
+  list(
+    sapply(ci, `[[`, "p_hat"),
+    sapply(ci, `[[`, "lower"),
+    sapply(ci, `[[`, "upper")
+  )
+}]
+setorder(by_type, -return_rate)
+
+fwrite(by_type, file.path(TABLE_DIR, "09_return_rate_by_product_type.csv"))
+by_type
+```
+
+```{r return-rate-by-type-plot}
+by_type[, productType := factor(productType, levels = productType[order(return_rate)])]
+
+p_type <- ggplot(by_type, aes(x = productType, y = return_rate)) +
+  geom_col(fill = "#4C72B0", width = 0.6) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
+  coord_flip() +
+  scale_y_continuous(labels = percent) +
+  labs(
+    title = "Return rate by product type",
+    subtitle = "Error bars are Wilson 95% confidence intervals",
+    x = NULL, y = "Return rate"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_type
+save_plot(p_type, "03_return_rate_by_product_type.png")
+```
+
+Confidence intervals are tight because per-category sample sizes are large — the spread between the highest- and lowest-return-rate categories is a real, well-estimated effect. This directly motivates the category-aware CRC extension in Stage 3: a single global threshold calibrated on the overall return rate would be miscalibrated at both ends of this range.
+
+# 8.4 Customer history density by outcome
+
+```{r customer-history-table}
+history_by_outcome <- train_dt[!is.na(customerReturnRate), .(
+  events = .N,
+  mean_hist_rate = mean(customerReturnRate),
+  median_hist_rate = median(customerReturnRate)
+), by = isReturned][order(isReturned)]
+history_by_outcome[, label := fifelse(isReturned == 1L, "Returned", "Retained")]
+
+fwrite(history_by_outcome, file.path(TABLE_DIR, "10_customer_history_by_outcome.csv"))
+history_by_outcome
+```
+
+```{r customer-history-plot}
+plot_dt <- train_dt[!is.na(customerReturnRate)]
+plot_dt[, label := fifelse(isReturned == 1L, "Returned", "Retained")]
+
+p_history <- ggplot(plot_dt, aes(x = customerReturnRate, fill = label)) +
+  geom_density(alpha = 0.5) +
+  scale_x_continuous(labels = percent) +
+  scale_fill_manual(values = c("Retained" = "#4C72B0", "Returned" = "#C44E52")) +
+  labs(
+    title = "Historical customer return rate, by current-order outcome",
+    x = "Historical customer return rate", y = "Density", fill = NULL
+  ) +
+  theme_minimal(base_size = 12)
+
+p_history
+save_plot(p_history, "04_customer_history_density.png")
+```
+
+Customers whose current order is later returned have a markedly higher historical return rate, but the overlap is large enough that history alone is not a perfect predictor — it's a strong feature, not a decision rule by itself.
+
+# 8.5 Discount ratio vs. return rate (10 equal-count bins)
+
+```{r discount-bins-table}
+disc_dt <- train_dt[!is.na(discount_ratio)]
+disc_dt[, discount_decile := cut(
+  discount_ratio,
+  breaks = quantile(discount_ratio, probs = seq(0, 1, 0.1), names = FALSE),
+  include.lowest = TRUE,
+  labels = FALSE
+)]
+
+discount_bins <- disc_dt[, .(
+  events = .N,
+  mean_discount_ratio = mean(discount_ratio),
+  return_rate = mean(isReturned)
+), by = discount_decile][order(discount_decile)]
+
+fwrite(discount_bins, file.path(TABLE_DIR, "11_discount_ratio_bins.csv"))
+discount_bins
+```
+
+```{r discount-bins-plot}
+p_discount <- ggplot(discount_bins, aes(x = discount_decile, y = return_rate)) +
+  geom_col(fill = "#55A868", width = 0.7) +
+  geom_line(color = "#333333", linewidth = 0.8) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = 1:10) +
+  scale_y_continuous(labels = percent) +
+  labs(
+    title = "Return rate by discount-ratio decile",
+    subtitle = "Decile 1 = lowest discount, Decile 10 = highest discount",
+    x = "Discount-ratio decile", y = "Return rate"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_discount
+save_plot(p_discount, "05_discount_ratio_vs_return_rate.png")
+```
+
+Return rate falls almost monotonically as discount ratio rises. Framed as association, not causation — product type, price and customer mix are confounders here, not controlled for in this simple bin-based view.
+
+# 8.6 Return rate by official period (training vs. future test)
+
+```{r period-comparison-table}
+period_dt <- rbindlist(list(
+  train_dt[, .(period = "Sep-Oct 2021 (training)", events = .N, returns = sum(isReturned == 1L))],
+  future_dt[, .(period = "Oct-Nov 2021 (future test)", events = .N, returns = sum(isReturned == 1L))]
+))
+
+period_dt[, c("return_rate", "ci_lower", "ci_upper") := {
+  ci <- Map(wilson_ci, returns, events)
+  list(
+    sapply(ci, `[[`, "p_hat"),
+    sapply(ci, `[[`, "lower"),
+    sapply(ci, `[[`, "upper")
+  )
+}]
+
+fwrite(period_dt, file.path(TABLE_DIR, "12_return_rate_by_period.csv"))
+period_dt
+```
+
+```{r period-comparison-plot}
+period_dt[, period := factor(period, levels = period)]
+
+p_period <- ggplot(period_dt, aes(x = period, y = return_rate)) +
+  geom_col(fill = "#8172B2", width = 0.5) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.15) +
+  scale_y_continuous(labels = percent, limits = c(0, NA)) +
+  labs(
+    title = "Return rate: official training vs. official future-test period",
+    subtitle = "Error bars are Wilson 95% confidence intervals",
+    x = NULL, y = "Return rate"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_period
+save_plot(p_period, "08_return_rate_by_official_period.png")
+```
+
+A small but statistically clear drop between periods (check whether the CIs overlap in the table above). Small in magnitude, but this is exactly the kind of shift the Stage 3 future-period drift audit is designed to catch — the point of that audit is not to detect a large shock, but to confirm that calibration and CRC risk-target satisfaction don't quietly degrade even under a modest, realistic shift.
+
+# Stage 2 checklist — confirm before moving on
+
+- [ ] `outputs/figures/` contains `01_return_class_distribution.png` through `05_discount_ratio_vs_return_rate.png`, plus `08_return_rate_by_official_period.png`
+- [ ] `outputs/tables/` contains `07_return_class_distribution.csv` through `12_return_rate_by_period.csv`
+- [ ] Your return-rate-by-product-type spread and your training-vs-future-test gap look consistent with Sections 8.3 and 8.6 of the project report
+- [ ] Figures `06_*` and `07_*` are still absent — that's expected; they belong to Stage 3
+
+Once every box is checked, you're ready for **Stage 3** (`03_calibration_crc_visualizations.qmd`) — the baseline model, calibration comparison, and Conformal Risk Control.
+
+```{r session-info}
+sessionInfo()
+```

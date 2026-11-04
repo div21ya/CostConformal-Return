@@ -1,0 +1,576 @@
+---
+title: "CostConformal-Return: Comprehensive Project Report"
+subtitle: "Calibrated machine learning and Conformal Risk Control for value-sensitive e-commerce return intervention"
+author: 24BDS1031
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    df-print: kable
+    theme: cosmo
+execute:
+  echo: false
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+knitr::opts_knit$set(root.dir = normalizePath("."))
+source(file.path("R", "00_setup.R"))
+
+safe_read <- function(name) {
+  path <- file.path(TABLE_DIR, name)
+  if (!file.exists(path)) return(NULL)
+  tryCatch(fread(path), error = function(e) NULL)
+}
+safe_kable <- function(x, digits = 4, caption = NULL) {
+  if (is.null(x) || nrow(x) == 0) cat("*Output unavailable at render time.*")
+  else knitr::kable(x, digits = digits, caption = caption, format = "html")
+}
+pct <- function(x, d = 2) ifelse(is.na(x), "—", paste0(formatC(100 * x, format = "f", digits = d), "%"))
+num <- function(x, d = 0) ifelse(is.na(x), "—", formatC(x, format = "f", digits = d, big.mark = ","))
+get1 <- function(x, col) if (!is.null(x) && col %in% names(x) && nrow(x)) x[[col]][1] else NA
+
+validation_summary <- safe_read("01_dataset_validation_summary.csv")
+join_audit <- safe_read("02_join_audit.csv")
+splits <- safe_read("03_split_summary.csv")
+feature_dictionary <- safe_read("06_feature_dictionary.csv")
+class_dist <- safe_read("07_return_class_distribution.csv")
+price_outcome <- safe_read("08_price_by_return_outcome.csv")
+product_rates <- safe_read("09_return_rate_by_product_type.csv")
+customer_history <- safe_read("10_customer_history_by_outcome.csv")
+discount_bins <- safe_read("11_discount_ratio_bins.csv")
+period_rates <- safe_read("12_return_rate_by_period.csv")
+missing_before <- safe_read("13_missingness_before.csv")
+missing_after <- safe_read("14_missingness_after.csv")
+encoding <- safe_read("15_encoding_scheme.csv")
+normalization <- safe_read("16_normalization_parameters.csv")
+feature_decisions <- safe_read("fe_07_final_feature_decision.csv")
+db_rows <- safe_read("db_01_row_counts.csv")
+leaderboard <- safe_read("model_zoo_01_leaderboard.csv")
+model_failures <- safe_read("model_zoo_02_failures.csv")
+tuning_summary <- safe_read("model_tuning_summary.csv")
+tuning_comparison <- safe_read("tune_05_baseline_vs_tuned.csv")
+model_performance <- safe_read("model_performance_comparison.csv")
+final_selection <- safe_read("model_final_selection.csv")
+auc_bootstrap <- safe_read("model_auc_paired_bootstrap.csv")
+calibration <- safe_read("model_15_calibration_final_evaluation.csv")
+calibration_curve <- safe_read("model_16_calibration_curve_quality.csv")
+crc_final <- safe_read("model_18_crc_final_evaluation.csv")
+workload <- safe_read("model_19_intervention_workload.csv")
+exposure <- safe_read("model_20_value_exposure_summary.csv")
+category_crc <- safe_read("model_21_category_crc_final_evaluation.csv")
+category_thresholds <- safe_read("model_22_category_threshold_differences.csv")
+subgroups <- safe_read("model_23_subgroup_final_evaluation.csv")
+drift <- safe_read("model_24_future_drift_final_evaluation.csv")
+future_calibration <- safe_read("model_25_future_calibration_evaluation.csv")
+stage_status <- safe_read("model_27_final_stage3_status.csv")
+policy_compare <- safe_read("p3_10_final_policy_comparison.csv")
+wilson_ci <- safe_read("s10_01_wilson_ci_intervention_rate.csv")
+boot_holdout <- safe_read("s10_02_bootstrap_holdout_comparison.csv")
+boot_future <- safe_read("s10_03_bootstrap_future_risk_comparison.csv")
+significance <- safe_read("s10_04_significance_summary.csv")
+training_row <- validation_summary[grepl("training", split, ignore.case = TRUE)][1]
+future_row <- validation_summary[grepl("future", split, ignore.case = TRUE)][1]
+best_model <- final_selection[selected == TRUE & model_id == "xgboost"][1]
+policy_focus <- policy_compare[model_id == "xgboost" & alpha == .05][1]
+```
+
+# Abstract
+
+CostConformal-Return converts e-commerce return prediction into a value-sensitive intervention policy. The ASOS benchmark event, customer-node and product-node data are validated, joined safely, preprocessed, explored and modelled with a broad machine-learning model zoo. Leading models are tuned and their return probabilities are calibrated before being passed to Conformal Risk Control (CRC).
+
+The final decision layer does not use an arbitrary probability cutoff. CRC selects a policy threshold for a chosen risk target. The risk is value-weighted missed-return exposure: the proportion of return value left untreated by the intervention policy. This connects the statistical result to a practical business decision: how much intervention workload is required to keep missed-return exposure below an acceptable level.
+
+The final project evaluates global and category-aware CRC policies, subgroup intervention burden, future-period drift, calibration stability and paired-bootstrap statistical comparisons between XGBoost and Elastic-Net. It therefore provides both predictive evidence and policy assurance.
+
+# 1. Introduction
+
+E-commerce returns create reverse-logistics costs, reduce availability and affect customer operations. A conventional classifier gives a likelihood of return, but a deployable system needs more: calibrated probabilities, a defensible intervention threshold, awareness that orders differ in value, and evidence that the policy remains safe outside the development sample.
+
+The project answers the following research question:
+
+> Can calibrated machine-learning probabilities be transformed into an intervention policy that controls value-weighted missed-return exposure at a chosen risk level?
+
+The project has three phases.
+
+1.  **Phase 1:** Data conversion, validation, leakage-safe joins and splits, preprocessing, exploratory analysis and baseline CRC.
+2.  **Phase 2:** Feature engineering, SQLite connectivity, a model zoo, hyperparameter tuning and model selection.
+3.  **Phase 3:** Final calibration, global/category-aware CRC, subgroup and future-period audit, and bootstrap statistical comparison.
+
+# 2. Dataset Description
+
+## 2.1 Source data and unit of analysis
+
+The benchmark contains event records together with customer and product node tables, for an official training period and a later official future-test period. Each row is an event/order observation with binary return outcome isReturned. Customer and product variables are joined using valid identifiers. Return-reason ratio variables are intentionally excluded because they would reveal information after the outcome and introduce leakage.
+
+```{r dataset-validation}
+safe_kable(validation_summary, 4, "Official dataset validation summary")
+```
+
+The data-validation outputs document row counts, unique customers/variants, return counts, return rates and repeated event triplets. They preserve the event-level interpretation rather than silently deleting repeated records.
+
+## 2.2 Join audit and data completeness
+
+```{r joins}
+safe_kable(join_audit, 4, "Customer/product node join audit")
+```
+
+Customer matching is high; product-node matching is lower. This is treated as information rather than hidden: customer_missing and product_missing flags are retained, while imputations and categorical handling are learned from training data only.
+
+## 2.3 Split design
+
+```{r splits}
+safe_kable(splits, 4, "Leakage-safe analysis split summary")
+```
+
+The modelling splits serve distinct purposes: model training fits algorithms, validation selects/tunes them, an independent calibration split selects policy thresholds, IID holdout evaluates the fixed policy, and the official future test assesses temporal robustness. This separation is one of the most important protections against optimistic evaluation.
+
+## 2.4 Predictor groups
+
+Predictors cover customer history, product history, product type and brand, demographic/shipping fields, price/discount variables, transformed variables, interactions and missingness indicators. The target is return status. The policy weight value_exposure represents the relative value at risk for a missed return.
+
+```{r dictionary}
+safe_kable(feature_dictionary, 3, "Feature dictionary")
+```
+
+# 3. EDA and Visualisations
+
+## 3.1 Class distribution
+
+```{r class-table}
+safe_kable(class_dist, 4, "Return-class distribution")
+```
+
+Returns comprise roughly 55% of the data. This is not an extreme class-imbalance setting, but accuracy alone is still inadequate because the downstream decision requires ranking quality, probability quality and value-sensitive residual-risk control.
+
+```{r class-fig, out.width="85%", fig.cap="Return class distribution"}
+knitr::include_graphics(file.path(FIGURE_DIR, "01_return_class_distribution.png"))
+```
+
+## 3.2 Price and return outcome
+
+```{r price-table}
+safe_kable(price_outcome, 4, "Price statistics by return outcome")
+```
+
+```{r price-fig, out.width="85%", fig.cap="Product price distribution by return outcome"}
+knitr::include_graphics(file.path(FIGURE_DIR, "02_product_price_by_return_outcome.png"))
+```
+
+Price is used as contextual predictive information and contributes to the value-sensitive analysis; the project does not assume that price alone determines return behaviour.
+
+## 3.3 Product-type, customer-history and discount patterns
+
+```{r product-table}
+safe_kable(product_rates[order(-return_rate)], 4, "Return rates by product type")
+```
+
+```{r product-fig, out.width="85%", fig.cap="Return rate by product type"}
+knitr::include_graphics(file.path(FIGURE_DIR, "03_return_rate_by_product_type.png"))
+```
+
+```{r customer-table}
+safe_kable(customer_history, 4, "Customer-history summary by outcome")
+```
+
+```{r history-fig, out.width="85%", fig.cap="Customer history density by outcome"}
+knitr::include_graphics(file.path(FIGURE_DIR, "04_customer_history_density.png"))
+```
+
+```{r discount-table}
+safe_kable(discount_bins, 4, "Return rate by discount-ratio bin")
+```
+
+```{r discount-fig, out.width="85%", fig.cap="Discount ratio and return rate"}
+knitr::include_graphics(file.path(FIGURE_DIR, "05_discount_ratio_vs_return_rate.png"))
+```
+
+**EDA inference.** Return behaviour is heterogeneous across product types and customer history. This supports nonlinear models and explains why a category-aware policy can be useful: a global threshold need not create equal residual risk in every product segment.
+
+## 3.4 Temporal pattern
+
+```{r period-table}
+safe_kable(period_rates, 4, "Return rates by official period")
+```
+
+```{r period-fig, out.width="85%", fig.cap="Return rate by official period"}
+knitr::include_graphics(file.path(FIGURE_DIR, "08_return_rate_by_official_period.png"))
+```
+
+The future period has a slightly different return rate from the training period. A modest prevalence change alone cannot establish policy safety, which is why the project later tests realised risk and calibration in the future period.
+
+# 4. Statistical Analysis
+
+## 4.1 Descriptive analysis
+
+The descriptive evidence comprises event counts, class proportions, product-type rates and confidence intervals, price/outcome summaries, customer-history summaries, discount bins, missingness reports and time-period comparison. Together they show that the data are large, heterogeneous and operationally relevant.
+
+- Return prevalence is near 55% across the main modelling splits.
+- Return rates differ substantially by product type.
+- Customer and product historical rates contain meaningful behavioural signal.
+- Product-join gaps are material enough to require explicit missingness handling.
+- A future period is available, enabling stronger temporal evaluation than a single random holdout.
+
+## 4.2 Missingness, encoding and normalisation
+
+```{r missingness}
+safe_kable(missing_before, 4, "Missingness before preprocessing")
+safe_kable(missing_after, 4, "Missingness after preprocessing")
+```
+
+```{r preprocessing}
+safe_kable(encoding, 4, "Encoding scheme")
+safe_kable(normalization, 4, "Normalisation parameters")
+```
+
+All fitted preprocessing steps are derived from model-training data and then applied to downstream splits. This avoids information leakage and ensures that validation, calibration and holdout performance mimic the intended deployment sequence.
+
+## 4.3 Wilson confidence intervals
+
+Wilson confidence intervals are used for policy intervention rates. They quantify uncertainty in the percentage of orders that would receive an intervention at each risk target.
+
+```{r wilson}
+safe_kable(wilson_ci, 4, "Wilson 95% confidence intervals for IID-holdout intervention rate")
+```
+
+## 4.4 Paired-bootstrap inference
+
+The final two candidate models, XGBoost and Elastic-Net, are compared on matched records with paired bootstrap resampling. A comparison is marked statistically significant when its confidence interval for the model difference excludes zero.
+
+```{r boot-holdout}
+safe_kable(boot_holdout, 5, "Paired bootstrap comparisons on IID holdout")
+```
+
+```{r boot-future}
+safe_kable(boot_future, 5, "Paired bootstrap comparisons on future test")
+```
+
+```{r significance}
+safe_kable(significance, 5, "Consolidated statistical-significance summary")
+```
+
+**Statistical inference.** No model is universally preferable at every target. The better choice depends on the permitted risk and the workload that the business accepts. This is a policy comparison, not merely a ranking contest.
+
+# 5. ML Models Used
+
+## 5.1 End-to-end model and policy architecture
+
+```{mermaid}
+flowchart LR
+  A[Raw event, customer and product data] --> B[Validation and leakage-safe joins]
+  B --> C[Train-only preprocessing and feature engineering]
+  C --> D[Model zoo]
+  D --> E[Tuning and validation selection]
+  E --> F[Probability calibration]
+  F --> G[Independent CRC calibration split]
+  G --> H[Global and category-aware thresholds]
+  H --> I[IID holdout, subgroup and future-period audit]
+  I --> J[Return-intervention decision]
+```
+
+The model zoo includes logistic regression, ridge/lasso/elastic-net logistic regression, Naive Bayes, KNN, linear SVM, neural network, decision tree, random forest, Extra Trees, GBM, XGBoost and LightGBM.
+
+## 5.2 Complete model-zoo results
+
+```{r leaderboard}
+safe_kable(leaderboard[order(-auc)], 4, "Model-zoo validation leaderboard")
+```
+
+```{r auc-fig, out.width="85%", fig.cap="Model comparison by ROC-AUC"}
+knitr::include_graphics(file.path(FIGURE_DIR, "model_auc_comparison.png"))
+```
+
+```{r pr-fig, out.width="85%", fig.cap="Model comparison by precision-recall AUC"}
+knitr::include_graphics(file.path(FIGURE_DIR, "model_pr_auc_comparison.png"))
+```
+
+```{r brier-fig, out.width="85%", fig.cap="Model comparison by Brier score"}
+knitr::include_graphics(file.path(FIGURE_DIR, "model_brier_comparison.png"))
+```
+
+XGBoost has the highest validation ROC-AUC. LightGBM and GBM are close tree-based alternatives. Elastic-Net is competitive and supplies a distinct, more interpretable linear-family model. KNN is clearly labelled as a subsample evaluation where applicable, avoiding a misleading direct comparison to full-validation models.
+
+## 5.3 Feature engineering and selection
+
+```{r features-selected}
+safe_kable(feature_decisions, 4, "Final feature decision table")
+```
+
+```{r rf-importance, out.width="85%", fig.cap="Random-forest feature-importance screening"}
+knitr::include_graphics(file.path(FIGURE_DIR, "12_rf_importance_screening.png"))
+```
+
+The feature process combines near-zero-variance screening, correlation filtering, VIF checks, LASSO retention and random-forest importance. Linear and tree models can retain different valid feature representations.
+
+## 5.4 Tuning and candidate selection
+
+```{r tuning}
+safe_kable(tuning_summary, 5, "Hyperparameter tuning summary")
+safe_kable(tuning_comparison, 5, "Baseline versus tuned models")
+```
+
+```{r tuning-fig, out.width="85%", fig.cap="Model-tuning gain"}
+knitr::include_graphics(file.path(FIGURE_DIR, "model_tuning_gain.png"))
+```
+
+```{r selection}
+safe_kable(final_selection, 5, "Final model selection")
+```
+
+**Model inference.** XGBoost is selected as the top validation model. Elastic-Net is retained because it is within the stated selection margin and represents a different modelling family, enabling a more meaningful policy robustness comparison.
+
+# 6. Calibration and Conformal Risk Control
+
+## 6.1 Calibration results
+
+Calibration checks whether a predicted probability corresponds to the observed event frequency. This is essential because the decision rule is based on probability thresholds.
+
+```{r calibration}
+safe_kable(calibration, 5, "Final calibration-method evaluation")
+safe_kable(calibration_curve, 5, "Calibration-curve diagnostics")
+```
+
+```{r calibration-fig, out.width="85%", fig.cap="Calibration curve"}
+knitr::include_graphics(file.path(FIGURE_DIR, "07_calibration_curve.png"))
+```
+
+Isotonic regression is selected by the reported Brier score and log-loss values. Its calibration improvement may be numerically small, but it matters because CRC requires reliable probability estimates when choosing a policy threshold.
+
+## 6.2 Global CRC policy
+
+For each risk tolerance alpha, CRC computes a threshold tau. Orders with calibrated return probability at least tau receive an intervention. The controlled quantity is value-weighted missed-return exposure, not simple false-negative count.
+
+```{r crc}
+safe_kable(crc_final, 5, "Global CRC final evaluation")
+```
+
+```{r exposure-workload}
+safe_kable(exposure, 5, "Value-exposure summary")
+safe_kable(workload, 5, "CRC intervention workload")
+```
+
+```{r workload-fig, out.width="85%", fig.cap="Exposure and intervention workload by threshold"}
+knitr::include_graphics(file.path(FIGURE_DIR, "06_value_exposure_and_intervention_by_threshold.png"))
+```
+
+The results show the expected trade-off: lower alpha requires a lower threshold and more intervention; higher alpha permits fewer interventions but more residual risk.
+
+## 6.3 Category-aware CRC
+
+```{r category-thresholds}
+safe_kable(category_thresholds[order(-absolute_threshold_difference)], 5, "Category-specific threshold differences")
+```
+
+```{r category-results}
+safe_kable(category_crc[order(-risk_with_global_threshold)], 5, "Category-aware CRC evaluation")
+```
+
+```{r category-fig, out.width="85%", fig.cap="Category-aware CRC risk"}
+knitr::include_graphics(file.path(FIGURE_DIR, "09_category_aware_crc_risk.png"))
+```
+
+**Policy inference.** Category-aware thresholds adapt when a global cutoff leaves disproportionate risk in a category. Some finite-sample category audits may still exceed the nominal target; this is reported as an operational monitoring finding, not hidden as a success claim.
+
+# 7. Final Policy Evaluation
+
+## 7.1 Candidate policy comparison
+
+```{r policy-comparison}
+safe_kable(policy_compare[order(alpha, model_id)], 5, "XGBoost versus Elastic-Net final CRC policy comparison")
+```
+
+Both models are tested at alpha values of 1%, 2.5%, 5%, 7.5% and 10%. Each row reports threshold, calibration workload, IID-holdout risk/workload, future-test risk/workload and target attainment.
+
+## 7.2 Subgroup burden audit
+
+```{r subgroup}
+safe_kable(subgroups, 5, "Subgroup intervention burden and missed exposure")
+```
+
+This audit is descriptive: it reveals differences in intervention rate and residual exposure across age and shipping-country groups. It should guide monitoring, not be interpreted as a causal claim of fairness or unfairness. Small groups and missing/OTHER categories require especially careful review.
+
+## 7.3 Drift and future-period calibration
+
+```{r drift}
+safe_kable(drift, 5, "Future-period drift diagnostics")
+safe_kable(future_calibration, 5, "Future-period calibration evaluation")
+```
+
+The PSI results are low and the listed variables do not trigger a drift alert. However, some future-period policy outcomes miss their selected target. This is a central inference: input-distribution monitoring alone is insufficient; realised outcome risk must be monitored and recalibration should be triggered when policy performance requires it.
+
+## 7.4 Final quality gate
+
+```{r stage-status}
+safe_kable(stage_status, 3, "Stage 3 completion and quality status")
+```
+
+# 8. Output Screenshots and Results
+
+The following figures are saved project outputs suitable for an oral presentation or report appendix.
+
+```{r roc-fig, out.width="85%", fig.cap="ROC curves"}
+knitr::include_graphics(file.path(FIGURE_DIR, "model_roc_curves.png"))
+```
+
+```{r pr-curves, out.width="85%", fig.cap="Precision-recall curves"}
+knitr::include_graphics(file.path(FIGURE_DIR, "model_pr_curves.png"))
+```
+
+```{r confusion, out.width="85%", fig.cap="Confusion matrices"}
+knitr::include_graphics(file.path(FIGURE_DIR, "model_confusion_matrices.png"))
+```
+
+```{r policy-fig, out.width="85%", fig.cap="Phase 3 policy-intervention comparison"}
+knitr::include_graphics(file.path(FIGURE_DIR, "p3_policy_intervention_comparison.png"))
+```
+
+```{r significance-fig, out.width="85%", fig.cap="Bootstrap confidence intervals"}
+knitr::include_graphics(file.path(FIGURE_DIR, "s10_difference_ci.png"))
+```
+
+# 9. Conclusion
+
+## 8.1 Inference from every output graph
+
+The following graph-by-graph inferences are also placed directly below their figures in the Word report.
+
+1.  **Return class distribution:** Returns are close to 55% of events, so probability quality and cost-sensitive missed exposure matter beyond accuracy.
+2.  **Product price by outcome:** Price distributions overlap, so price is useful with other predictors rather than as a standalone rule.
+3.  **Return rate by product type:** Strong category differences validate product type as a predictor and motivate category-aware thresholds.
+4.  **Customer history density:** Historical customer behaviour differs by outcome, confirming its predictive value.
+5.  **Discount ratio versus return rate:** Discount changes observed behaviour but is insufficient for a fixed rule; it belongs in the multivariable model.
+6.  **Return rate by official period:** Even a small future-period shift requires temporal policy testing.
+7.  **ROC-AUC comparison:** XGBoost has the strongest ranking, while close alternatives justify retaining Elastic-Net as a finalist.
+8.  **PR-AUC comparison:** Leading models also separate returned orders well when emphasis is placed on the positive class.
+9.  **Brier-score comparison:** Stronger models have better probability quality, but calibration remains necessary before thresholding.
+10. **Tuning gain:** Tuning produces incremental gains, making model-family choice and calibration equally important.
+11. **Calibration curve:** Isotonic calibration improves agreement between predicted and observed return rates.
+12. **Exposure/workload trade-off:** Stricter risk targets require intervention on more orders.
+13. **Category-aware CRC risk:** Category thresholds reduce excess risk in several categories; remaining misses require monitoring.
+14. **ROC curves:** Final candidates discriminate well, with XGBoost showing the best overall curve area.
+15. **Precision-recall curves:** The models can target high-probability returns effectively for selective interventions.
+16. **Confusion matrices:** Fixed-cutoff counts reveal the catch-versus-workload trade-off that CRC formalises.
+17. **Final policy comparison:** Workload falls as permitted risk rises, and the preferred finalist depends on the chosen target.
+18. **Bootstrap confidence intervals:** Intervals excluding zero show statistically detectable policy differences.
+
+CostConformal-Return is an end-to-end, decision-aware return-prediction project. It goes beyond a high-AUC classifier by integrating data validation, leakage prevention, reproducible preprocessing, feature selection, broad model comparison, tuning, calibrated probabilities and a risk-controlled intervention policy.
+
+The principal conclusions are:
+
+1.  **XGBoost is the strongest predictive model** on the full validation benchmark; Elastic-Net is a strong structured comparator.
+2.  **Isotonic calibration is the selected probability-calibration method**, enabling threshold decisions based on better probability quality.
+3.  **CRC makes the business trade-off explicit:** stricter risk targets need more intervention workload, while looser targets permit more value-weighted missed exposure.
+4.  **Category-aware thresholds improve policy granularity** but must be paired with empirical subgroup monitoring.
+5.  **Future evaluation changes the decision picture:** low PSI does not guarantee all future policy targets will be met, so the recalibration recommendation is justified.
+
+Recommended next steps are scheduled recalibration using newly labelled outcomes, monitoring subgroup burden, documenting true intervention costs and creating an online scoring service with logged policy decisions and outcomes.
+
+# 10. R Code
+
+## 10.1 Source-code map
+
+The complete reproducible R/Quarto source is retained in the project root.
+
+| Stage | File | Purpose |
+|------------------------|------------------------|------------------------|
+| Shared setup | R/00_setup.R | Paths, safe I/O, metrics and confidence intervals |
+| 1 | 01_data_preparation.qmd | Validation, joins, leakage prevention and splits |
+| 1.5 | 01b_preprocessing.qmd | Imputation, encoding and normalisation |
+| 2 | 02_eda_visualizations.qmd | Exploratory data analysis |
+| 3 | 03_calibration_crc_visualizations.qmd | Baseline calibration and CRC |
+| 4 | 04_feature_engineering.qmd | Feature engineering and selection |
+| 5 | 05_database_connectivity.qmd | SQLite persistence and retrieval |
+| 6 | 06_model_zoo.qmd | Multi-algorithm model training |
+| 7 | 07_hyperparameter_tuning.qmd | Tuning grids |
+| 8 | 08_comparative_evaluation.qmd | Final model comparison |
+| 9 | 09_phase3_crc_policy_evaluation.qmd | Final CRC policy evaluation |
+| 10 | 10_statistical_analysis.qmd | Wilson and bootstrap analysis |
+
+## 10.2 Core R calculation examples
+
+```{r code-examples, echo=TRUE}
+auc_roc <- function(y_true, y_prob) {
+  ok <- !is.na(y_true) & !is.na(y_prob)
+  y_true <- y_true[ok]; y_prob <- y_prob[ok]
+  n_pos <- as.double(sum(y_true == 1)); n_neg <- as.double(sum(y_true == 0))
+  r <- rank(y_prob, ties.method = "average")
+  (sum(r[y_true == 1]) - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+}
+
+brier_score <- function(y_true, y_prob) {
+  ok <- !is.na(y_true) & !is.na(y_prob)
+  mean((y_prob[ok] - y_true[ok])^2)
+}
+
+apply_crc_policy <- function(calibrated_probability, tau) {
+  as.integer(calibrated_probability >= tau)
+}
+
+value_weighted_missed_exposure <- function(y_true, intervention, value_exposure) {
+  missed <- y_true == 1 & intervention == 0
+  sum(value_exposure[missed], na.rm = TRUE) / sum(value_exposure[y_true == 1], na.rm = TRUE)
+}
+```
+
+# 11. GitHub Repository
+
+**Repository URL:** \[INSERT YOUR GITHUB REPOSITORY URL HERE\]
+
+Suggested repository layout:
+
+``` text
+CostConformal-Return/
+├── 01_data_preparation.qmd ... 12_comprehensive_project_report.qmd
+├── R/00_setup.R
+├── data/                 # raw, processed and SQLite data
+├── models/               # trained model artifacts
+├── outputs/figures/      # report figures
+├── outputs/tables/       # saved numeric evidence
+├── files/                # rendered HTML reports
+└── live_demo/            # interactive results explorer
+```
+
+Before publishing, add a root README with the project aim, system/R/Python requirements, package versions or renv lockfile, render order, data-access rules and demo instructions. Do not publish private or licence-restricted raw data.
+
+# Appendix A. Complete Output Inventory
+
+```{r inventory}
+output_files <- data.table(file = basename(list.files(TABLE_DIR, pattern = "\\.csv$", full.names = TRUE)))
+output_files[, stage := fifelse(grepl("^(01|02|03|04|05|06|07|08|09|10|11|12|13|14|15|16)_", file), "Phase 1",
+  fifelse(grepl("^(fe_|db_|model_zoo|tune_|model_(auc|confusion|xgboost|elastic|comparison|final|performance|tuning))", file), "Phase 2",
+  fifelse(grepl("^(p3_|s10_|model_0[1-9]|model_1[0-9]|model_2[0-7])", file), "Phase 3", "Supporting")))]
+safe_kable(output_files[order(stage, file)], 0, "All persisted output tables")
+```
+
+# Appendix B. Supporting outputs
+
+```{r failures}
+safe_kable(model_failures, 4, "Model-zoo failures, if any")
+```
+
+```{r database}
+safe_kable(db_rows, 2, "SQLite database row counts")
+```
+
+```{r auc-bootstrap}
+safe_kable(auc_bootstrap, 5, "Paired bootstrap AUC comparison")
+```
+
+# Appendix C. Complete Result Evidence and Artifact Inventory
+
+The Word version of File 12 additionally reproduces every remaining CSV table from the outputs directory, including feature-engineering diagnostics, tuning grids, raw/calibrated comparisons, Phase 3 intermediate diagnostics and the complete ROC/PR curve-point data. This makes the document a complete saved-result record rather than a selection of headline tables.
+
+The following project artifacts are also retained and listed in the Word appendix:
+
+- all serialized model-zoo, tuned-model, calibrator, feature-selector, preprocessor and registry artifacts in the models directory;
+- all 24 report figures, including correlation, LASSO, random-forest, Elastic-Net and XGBoost importance visualisations; and
+- the rendered HTML reports for stages 1 to 11 in the files directory.
+
+Additional graph interpretations added in the document cover the correlation heatmap, LASSO coefficient plot, random-forest importance plot, both finalist feature-importance plots and the IID-holdout risk comparison.

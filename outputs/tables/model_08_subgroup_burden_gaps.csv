@@ -1,0 +1,5 @@
+subgroup_variable,intervention_rate_gap,false_negative_exposure_gap,highest_missed_exposure_group
+age_band,0.308208553588953,0.0308178138636665,45-54
+shippingCountry,0.528422866133254,0.0503321056043218,Country_D
+isMale,0.101021844270052,0.0114355502832661,1
+premier,0.0198513981266764,0.00256210126159531,1

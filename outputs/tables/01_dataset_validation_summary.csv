@@ -1,0 +1,3 @@
+split,event_rows,customers,variants,return_count,retained_count,return_rate,repeated_triplets
+official_training,1369133,810237,432666,757227,611906,0.553070446771789,6551
+official_future_test,1460366,859794,441030,795366,665000,0.544634701163955,7223

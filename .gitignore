@@ -1,0 +1,24 @@
+# R temporary files
+.RData
+.RDataTmp
+.Rhistory
+.Rproj.user/
+
+# Sensitive files
+.env
+*.pem
+*.key
+
+# Large data and database artifacts
+data/raw_pickle/
+data/processed/
+data/*.sqlite
+models/
+
+# Large model and dataset files
+*.rds
+*.p
+*.csv.gz
+
+# Compressed archive
+files.zip

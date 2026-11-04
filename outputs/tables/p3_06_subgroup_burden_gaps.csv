@@ -1,0 +1,9 @@
+model_id,subgroup_variable,intervention_rate_gap,false_negative_exposure_gap,highest_missed_exposure_group
+xgboost,age_band,0.321251198618385,0.0332761160864804,45-54
+xgboost,shippingCountry,0.545147045930222,0.0533235539772104,Country_A
+xgboost,isMale,0.117005914073033,0.0152998528373615,1
+xgboost,premier,0.0150861104182588,0.00108558373959556,1
+elastic_net_logistic,age_band,0.318063429482594,0.0335022361713706,45-54
+elastic_net_logistic,shippingCountry,0.548984769026539,0.0561457794462299,Country_A
+elastic_net_logistic,isMale,0.11215710890952,0.0142086688262053,1
+elastic_net_logistic,premier,0.0151359614707201,0.00162867381817347,1

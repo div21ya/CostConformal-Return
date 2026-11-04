@@ -1,0 +1,4 @@
+feature,total_distinct_levels,kept_as_own_level,collapsed_to_other,rows_recoded_to_other
+age_band,7,7,0,0
+shippingCountry,10,9,1,46371
+productType,12,11,1,308238

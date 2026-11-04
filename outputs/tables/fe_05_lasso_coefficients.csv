@@ -1,0 +1,14 @@
+feature,coefficient,retained_by_lasso
+age,0,FALSE
+salesPerCustomer,0,FALSE
+returnsPerCustomer,0,FALSE
+log_sales_customer,-0.0145677927918107,TRUE
+avgDiscountValue,0,FALSE
+salesPerProduct,-0.000505181600736875,TRUE
+returnsPerProduct,0.000476795373911697,TRUE
+productReturnRate,7.09539095555132,TRUE
+log_returns_product,0,FALSE
+type_median_price,0.00528136267213013,TRUE
+customer_value_at_risk,0.364649777510277,TRUE
+product_customer_risk_gap,-4.57298726807927,TRUE
+male_premier,0,FALSE

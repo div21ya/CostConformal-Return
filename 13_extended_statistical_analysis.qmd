@@ -1,0 +1,357 @@
+---
+title: "CostConformal-Return — Extended Statistical Analysis"
+subtitle: "Descriptive, inferential, association, temporal, calibration and policy-risk analysis"
+author: 24BDS1031
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    df-print: kable
+    theme: cosmo
+execute:
+  echo: false
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = normalizePath("."))
+source(file.path("R", "00_setup.R"))
+set.seed(20261103)
+
+safe_read <- function(name) {
+  path <- file.path(TABLE_DIR, name)
+  if (!file.exists(path)) return(NULL)
+  tryCatch(fread(path), error = function(e) NULL)
+}
+show_table <- function(x, caption = NULL, digits = 4) {
+  if (is.null(x) || nrow(x) == 0) cat("*No result was available at render time.*")
+  else knitr::kable(x, caption = caption, digits = digits, format = "html")
+}
+sample_n <- function(x, n = 50000L) if (length(x) <= n) x else sample(x, n)
+smd <- function(a, b) {
+  a <- a[is.finite(a)]; b <- b[is.finite(b)]
+  den <- sqrt((var(a) + var(b)) / 2)
+  if (!is.finite(den) || den == 0) return(NA_real_)
+  (mean(a) - mean(b)) / den
+}
+cramers_v <- function(tab) {
+  tst <- suppressWarnings(chisq.test(tab))
+  n <- sum(tab); k <- min(nrow(tab) - 1, ncol(tab) - 1)
+  if (n == 0 || k <= 0) return(NA_real_)
+  sqrt(as.numeric(tst$statistic) / (n * k))
+}
+analysis_columns <- c(
+  "isReturned", "age", "isMale", "premier", "shippingCountry", "productType",
+  "salesPerCustomer", "returnsPerCustomer", "customerReturnRate",
+  "avgGbpPrice", "avgDiscountValue", "salesPerProduct", "returnsPerProduct",
+  "productReturnRate", "discount_ratio", "type_median_price",
+  "price_to_type_median", "value_exposure", "customer_missing",
+  "product_missing", "missingness_count"
+)
+train_path <- file.path(PROCESSED_DIR, "model_train.csv.gz")
+assert_files_exist(train_path)
+analysis_dt <- read_csv_gz(train_path, select = analysis_columns)
+analysis_dt[, isReturned := as.integer(isReturned)]
+analysis_dt[, productType := fifelse(is.na(productType) | productType == "", "OTHER", productType)]
+analysis_dt[, shippingCountry := fifelse(is.na(shippingCountry) | shippingCountry == "", "OTHER", shippingCountry)]
+numeric_vars <- c(
+  "age", "salesPerCustomer", "returnsPerCustomer", "customerReturnRate",
+  "avgGbpPrice", "avgDiscountValue", "salesPerProduct", "returnsPerProduct",
+  "productReturnRate", "discount_ratio", "type_median_price",
+  "price_to_type_median", "value_exposure", "missingness_count"
+)
+split_summary <- safe_read("03_split_summary.csv")
+period_rates <- safe_read("12_return_rate_by_period.csv")
+calibration <- safe_read("model_15_calibration_final_evaluation.csv")
+crc_final <- safe_read("model_18_crc_final_evaluation.csv")
+policy_compare <- safe_read("p3_10_final_policy_comparison.csv")
+subgroups <- safe_read("model_23_subgroup_final_evaluation.csv")
+drift <- safe_read("model_24_future_drift_final_evaluation.csv")
+wilson <- safe_read("s10_01_wilson_ci_intervention_rate.csv")
+bootstrap_holdout <- safe_read("s10_02_bootstrap_holdout_comparison.csv")
+bootstrap_future <- safe_read("s10_03_bootstrap_future_risk_comparison.csv")
+```
+
+# Purpose and statistical scope
+
+This document complements the modelling reports with a broad but statistically valid analysis suite. It does not apply every named test indiscriminately: invalid assumptions, duplicate hypothesis tests and significance fishing weaken a study. The analyses below are selected because they match the variable types, sample design and decision objective.
+
+The scope includes data quality, descriptive statistics, uncertainty intervals, numeric and categorical group comparisons, effect sizes, correlation/multicollinearity, adjusted logistic associations, temporal analysis, calibration, CRC policy risk, bootstrap finalist comparison and subgroup monitoring.
+
+# 1. Data quality and composition
+
+## 1.1 Leakage-safe split structure
+
+```{r splits}
+show_table(split_summary, "Original analysis split summary")
+```
+
+The model-training, validation, calibration, IID-holdout and future-test roles are intentionally separated. This is a data-science design decision independently of ML: it protects all downstream summaries and policy assessment from optimistic information leakage.
+
+## 1.2 Event composition and binomial uncertainty
+
+```{r composition}
+composition <- analysis_dt[, .(
+  events = .N,
+  returned = sum(isReturned),
+  retained = sum(isReturned == 0),
+  return_rate = mean(isReturned)
+)]
+ci <- wilson_ci(composition$returned, composition$events)
+composition[, return_rate_ci_low := ci$lower]
+composition[, return_rate_ci_high := ci$upper]
+fwrite(composition, file.path(TABLE_DIR, "stat_01_training_composition.csv"))
+show_table(composition, "Training-split outcome composition with Wilson confidence interval")
+```
+
+**Inference:** The large sample produces a precise overall return-rate estimate. Precision in the historical sample does not itself prove future-period stability, which is evaluated later.
+
+## 1.3 Missingness profile
+
+```{r missingness}
+missing_profile <- data.table(
+  variable = names(analysis_dt),
+  missing_n = vapply(analysis_dt, function(x) sum(is.na(x)), integer(1)),
+  total_n = nrow(analysis_dt)
+)
+missing_profile[, missing_rate := missing_n / total_n]
+missing_profile <- missing_profile[order(-missing_rate)]
+fwrite(missing_profile, file.path(TABLE_DIR, "stat_02_missingness_profile.csv"))
+show_table(missing_profile, "Variable-level missingness profile")
+```
+
+```{r missingness-by-outcome}
+missing_by_outcome <- rbindlist(lapply(names(analysis_dt), function(col) {
+  data.table(
+    variable = col,
+    retained_missing_rate = mean(is.na(analysis_dt[isReturned == 0, get(col)])),
+    returned_missing_rate = mean(is.na(analysis_dt[isReturned == 1, get(col)]))
+  )
+}))
+missing_by_outcome[, gap_returned_minus_retained := returned_missing_rate - retained_missing_rate]
+fwrite(missing_by_outcome, file.path(TABLE_DIR, "stat_03_missingness_by_outcome.csv"))
+show_table(missing_by_outcome[order(-abs(gap_returned_minus_retained))],
+           "Outcome-stratified missingness rates")
+```
+
+**Inference:** Missingness may encode data-collection or catalogue availability patterns. Retaining customer/product missingness flags and fitting imputation on training data is statistically preferable to unconditional row deletion.
+
+# 2. Descriptive analysis
+
+## 2.1 Numeric variables
+
+```{r numeric-description}
+descriptive_numeric <- rbindlist(lapply(numeric_vars, function(v) {
+  x <- analysis_dt[[v]]
+  data.table(
+    variable = v, n_nonmissing = sum(is.finite(x)), mean = mean(x, na.rm = TRUE),
+    sd = sd(x, na.rm = TRUE), median = median(x, na.rm = TRUE),
+    q1 = quantile(x, .25, na.rm = TRUE), q3 = quantile(x, .75, na.rm = TRUE),
+    min = min(x, na.rm = TRUE), max = max(x, na.rm = TRUE)
+  )
+}))
+fwrite(descriptive_numeric, file.path(TABLE_DIR, "stat_04_descriptive_numeric.csv"))
+show_table(descriptive_numeric, "Central tendency, dispersion and quantiles")
+```
+
+## 2.2 Categorical variables and confidence intervals
+
+```{r category-rates}
+category_ci <- analysis_dt[, .(n = .N, returns = sum(isReturned)), by = productType]
+category_ci[, return_rate := returns / n]
+category_ci[, ci_low := mapply(function(s, n) wilson_ci(s, n)$lower, returns, n)]
+category_ci[, ci_high := mapply(function(s, n) wilson_ci(s, n)$upper, returns, n)]
+category_ci <- category_ci[order(-return_rate)]
+fwrite(category_ci, file.path(TABLE_DIR, "stat_05_product_type_rate_ci.csv"))
+show_table(category_ci, "Product-type return rates with Wilson 95% confidence intervals")
+```
+
+**Inference:** Medians and interquartile ranges should be emphasised for skewed commercial quantities. Product-type intervals quantify both the observed heterogeneity and its estimation precision.
+
+# 3. Returned versus retained: numeric-variable inference
+
+Welch tests compare group means without assuming equal variances. Mann–Whitney tests compare rank distributions and are robust to skew/outliers. Standardised mean difference supplies practical effect magnitude. For computationally stable reporting, each group is deterministically capped at 50,000 observations; the full descriptive analysis remains unchanged.
+
+```{r numeric-tests}
+numeric_tests <- rbindlist(lapply(numeric_vars, function(v) {
+  a <- sample_n(analysis_dt[isReturned == 1 & is.finite(get(v)), get(v)])
+  b <- sample_n(analysis_dt[isReturned == 0 & is.finite(get(v)), get(v)])
+  if (length(a) < 2 || length(b) < 2) return(data.table(variable = v))
+  tt <- t.test(a, b)
+  wt <- wilcox.test(a, b, exact = FALSE)
+  data.table(
+    variable = v, returned_mean = mean(a), retained_mean = mean(b),
+    mean_difference = mean(a) - mean(b), t_p_value = tt$p.value,
+    t_ci_low = tt$conf.int[1], t_ci_high = tt$conf.int[2],
+    wilcoxon_p_value = wt$p.value, standardized_mean_difference = smd(a, b)
+  )
+}), fill = TRUE)
+numeric_tests[, t_p_bh := p.adjust(t_p_value, method = "BH")]
+numeric_tests[, wilcoxon_p_bh := p.adjust(wilcoxon_p_value, method = "BH")]
+numeric_tests[, practical_effect := fifelse(abs(standardized_mean_difference) < .10, "negligible",
+  fifelse(abs(standardized_mean_difference) < .30, "small",
+    fifelse(abs(standardized_mean_difference) < .50, "moderate", "large")))]
+fwrite(numeric_tests, file.path(TABLE_DIR, "stat_06_numeric_outcome_tests.csv"))
+show_table(numeric_tests[order(-abs(standardized_mean_difference))],
+           "Numeric group comparisons, effect sizes and BH-adjusted p-values")
+```
+
+**Inference rule:** With a data set this large, a very small p-value can accompany a negligible difference. Practical conclusions should prioritise effect size and confidence intervals.
+
+# 4. Categorical association analysis
+
+Chi-square tests assess whether outcome composition changes across a categorical variable. Cramér's V reports association strength, preventing weak but statistically significant associations from being overstated.
+
+```{r categorical-tests}
+categorical_vars <- c("isMale", "premier", "productType", "shippingCountry",
+                      "customer_missing", "product_missing")
+categorical_tests <- rbindlist(lapply(categorical_vars, function(v) {
+  tab <- table(analysis_dt[[v]], analysis_dt$isReturned, useNA = "ifany")
+  test <- suppressWarnings(chisq.test(tab))
+  data.table(
+    variable = v, chi_square = as.numeric(test$statistic), df = as.numeric(test$parameter),
+    p_value = test$p.value, cramers_v = cramers_v(tab),
+    smallest_expected_count = min(test$expected)
+  )
+}))
+categorical_tests[, p_bh := p.adjust(p_value, method = "BH")]
+categorical_tests[, association_strength := fifelse(cramers_v < .10, "negligible",
+  fifelse(cramers_v < .30, "small", fifelse(cramers_v < .50, "moderate", "large")))]
+fwrite(categorical_tests, file.path(TABLE_DIR, "stat_07_categorical_association_tests.csv"))
+show_table(categorical_tests[order(-cramers_v)],
+           "Categorical association tests with Cramér's V")
+```
+
+# 5. Association, correlation and multicollinearity
+
+## 5.1 Spearman correlation
+
+Spearman rank correlation is appropriate for skewed variables and monotonic but non-linear relationships. Correlation describes association, not causation.
+
+```{r correlations}
+cor_vars <- setdiff(numeric_vars, "missingness_count")
+cor_matrix <- cor(analysis_dt[, ..cor_vars], method = "spearman", use = "pairwise.complete.obs")
+cor_long <- as.data.table(as.table(cor_matrix))
+setnames(cor_long, c("variable_1", "variable_2", "spearman_rho"))
+cor_long <- cor_long[variable_1 < variable_2][order(-abs(spearman_rho))]
+fwrite(cor_long, file.path(TABLE_DIR, "stat_08_spearman_correlations.csv"))
+show_table(head(cor_long, 30), "Top absolute Spearman correlations")
+```
+
+```{r correlation-plot, fig.cap="Spearman correlation heatmap for numeric predictors"}
+library(ggplot2)
+ggplot(cor_long, aes(variable_1, variable_2, fill = spearman_rho)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "#B2182B", mid = "white", high = "#2166AC",
+                       midpoint = 0, limits = c(-1, 1), name = "Spearman rho") +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 55, hjust = 1), axis.title = element_blank())
+ggsave(file.path(FIGURE_DIR, "stat_01_spearman_heatmap.png"), width = 9, height = 7, dpi = 250)
+```
+
+## 5.2 VIF screen
+
+```{r vif}
+show_table(safe_read("fe_04_vif_iterations.csv"), "Feature-engineering VIF iterations")
+```
+
+**Inference:** Correlation and VIF screening protect the interpretation of individual linear coefficients. They do not prove a causal relationship or prevent tree-based models from learning useful complementary signal.
+
+# 6. Adjusted logistic-regression associations
+
+This logistic model is an explanatory association model, not the final predictive model. It estimates adjusted odds ratios on a stratified analysis sample.
+
+```{r logistic-inference}
+logit_vars <- c("isReturned", "age", "isMale", "premier", "customerReturnRate",
+                "productReturnRate", "salesPerCustomer", "salesPerProduct",
+                "discount_ratio", "customer_missing", "product_missing", "productType")
+logit_dt <- na.omit(copy(analysis_dt[, ..logit_vars]))
+returned_idx <- sample_n(which(logit_dt$isReturned == 1), 75000L)
+retained_idx <- sample_n(which(logit_dt$isReturned == 0), 75000L)
+logit_dt <- logit_dt[c(returned_idx, retained_idx)]
+fit <- glm(isReturned ~ age + isMale + premier + customerReturnRate +
+  productReturnRate + salesPerCustomer + salesPerProduct + discount_ratio +
+  customer_missing + product_missing + productType,
+  data = logit_dt, family = binomial())
+co <- summary(fit)$coefficients
+logit_results <- data.table(
+  term = rownames(co), estimate = co[, "Estimate"], std_error = co[, "Std. Error"],
+  z_value = co[, "z value"], p_value = co[, "Pr(>|z|)"]
+)
+logit_results[, odds_ratio := exp(estimate)]
+logit_results[, or_ci_low := exp(estimate - 1.96 * std_error)]
+logit_results[, or_ci_high := exp(estimate + 1.96 * std_error)]
+logit_results[, p_bh := p.adjust(p_value, method = "BH")]
+fwrite(logit_results, file.path(TABLE_DIR, "stat_09_adjusted_logistic_odds_ratios.csv"))
+show_table(logit_results[term != "(Intercept)"][order(p_bh)],
+           "Adjusted logistic-regression odds ratios")
+```
+
+**Inference:** Odds ratios are adjusted observational associations within the stated model. They should not be interpreted as causal effects because unmeasured factors can confound customer/product relationships.
+
+# 7. Temporal, calibration and policy-risk analysis
+
+## 7.1 Official-period comparison and drift
+
+```{r period-and-drift}
+show_table(period_rates, "Return rates by official period")
+if (!is.null(period_rates) && nrow(period_rates) >= 2 &&
+    all(c("returns", "events") %in% names(period_rates))) {
+  ptest <- prop.test(period_rates$returns, period_rates$events)
+  period_test <- data.table(
+    chi_square = as.numeric(ptest$statistic), df = as.numeric(ptest$parameter),
+    p_value = ptest$p.value,
+    interpretation = "Test of equal return proportions across official periods"
+  )
+  fwrite(period_test, file.path(TABLE_DIR, "stat_10_period_proportion_test.csv"))
+  show_table(period_test, "Official-period proportion test")
+}
+show_table(drift, "Future-period distribution-drift diagnostics")
+```
+
+## 7.2 Calibration and CRC risk control
+
+```{r calibration-and-crc}
+show_table(calibration, "Final calibration-method evaluation")
+show_table(crc_final, "Global CRC risk-control evaluation")
+show_table(wilson, "Wilson intervals for intervention workload")
+```
+
+**Inference:** Calibration is required before a probability score is used as an operational threshold. CRC makes the workload-versus-residual-exposure trade-off explicit: stricter alpha targets require more intervention.
+
+## 7.3 Bootstrap comparison of final policies
+
+```{r bootstrap-policy}
+show_table(policy_compare, "Final XGBoost versus Elastic-Net policy comparison")
+show_table(bootstrap_holdout, "Paired bootstrap comparison on IID holdout")
+show_table(bootstrap_future, "Paired bootstrap comparison on future test")
+```
+
+**Inference:** A bootstrap confidence interval excluding zero indicates a statistically detectable difference for that metric/alpha. Practical choice still depends on whether the corresponding workload is acceptable.
+
+# 8. Subgroup burden and monitoring
+
+```{r subgroup}
+show_table(subgroups, "Subgroup intervention burden and false-negative exposure")
+```
+
+Subgroup outputs are descriptive monitoring statistics. They identify segments with differing intervention burden or residual exposure, but do not establish causal discrimination because groups differ in product mix, history, geography and data completeness.
+
+# 9. Statistical limitations and final conclusions
+
+1.  The data are observational: association and odds-ratio estimates are not causal claims.
+2.  Large samples make p-values sensitive; effect size and confidence intervals are essential.
+3.  Benjamini–Hochberg correction is applied within multi-test families.
+4.  Welch, rank-sum and bootstrap methods reduce sensitivity to non-normality and outliers.
+5.  IID evaluation does not replace future-period testing.
+6.  CRC controls the stated loss under its validation setup; realised future outcomes still require recalibration monitoring.
+7.  Value exposure is a policy proxy and should be validated against true operational cost before deployment.
+
+Even if the ML models are excluded, this project remains a strong data-science study: it contains data engineering, quality assurance, database work, EDA, feature analysis, descriptive statistics, inferential statistics, uncertainty quantification, temporal analysis, drift monitoring and value-sensitive decision analysis.

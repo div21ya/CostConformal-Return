@@ -1,0 +1,7 @@
+method,brier,model_id
+raw,0.172030074827124,xgboost
+platt,0.171992546020341,xgboost
+isotonic,0.172086132549093,xgboost
+raw,0.173499024053504,elastic_net_logistic
+platt,0.1735524359766,elastic_net_logistic
+isotonic,0.17300849391098,elastic_net_logistic

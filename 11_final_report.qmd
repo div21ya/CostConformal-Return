@@ -1,0 +1,247 @@
+---
+title: "CostConformal-Return — Final Report"
+subtitle: "Category-Aware and Future-Period Drift-Audited Conformal Risk Control for Value-Sensitive E-Commerce Returns"
+author: "Simran Kumari (24BDS1031)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    df-print: kable
+    theme: cosmo
+execute:
+  echo: false
+  warning: false
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = normalizePath("."))
+source(file.path("R", "00_setup.R"))
+```
+
+```{r helpers}
+safe_fread <- function(path) if (file.exists(path)) tryCatch(fread(path), error = function(e) NULL) else NULL
+fmt_pct <- function(x, digits = 2) if (length(x) == 0 || is.null(x) || is.na(x)) "**[pending — table not yet rendered]**" else paste0(round(x * 100, digits), "%")
+fmt_num <- function(x, digits = 4) if (length(x) == 0 || is.null(x) || is.na(x)) "**[pending]**" else format(round(x, digits), nsmall = digits, big.mark = ",")
+cell <- function(dt, row, col) {
+  if (is.null(dt) || is.null(row) || nrow(row) == 0) return(NA)
+  if (!col %in% names(row)) return(NA)
+  row[[col]][1]
+}
+# Returns the first row of dt whose `col` matches `pattern` (empty table if dt is missing).
+pick_row <- function(dt, col, pattern) {
+  if (is.null(dt) || !col %in% names(dt)) return(data.table())
+  dt[grepl(pattern, get(col), ignore.case = TRUE)][1]
+}
+```
+
+```{r load-phase1}
+tbl01 <- safe_fread(file.path(TABLE_DIR, "01_dataset_validation_summary.csv"))
+tbl02 <- safe_fread(file.path(TABLE_DIR, "02_join_audit.csv"))
+tbl03 <- safe_fread(file.path(TABLE_DIR, "03_split_summary.csv"))
+tbl09 <- safe_fread(file.path(TABLE_DIR, "09_return_rate_by_product_type.csv"))
+tbl12 <- safe_fread(file.path(TABLE_DIR, "12_return_rate_by_period.csv"))
+model14 <- safe_fread(file.path(TABLE_DIR, "model_14_raw_model_performance.csv"))
+model17 <- safe_fread(file.path(TABLE_DIR, "model_17_calibrated_performance.csv"))
+model01 <- safe_fread(file.path(TABLE_DIR, "model_01_calibration_comparison.csv"))
+model18 <- safe_fread(file.path(TABLE_DIR, "model_18_crc_final_evaluation.csv"))
+model11 <- safe_fread(file.path(TABLE_DIR, "model_11_recalibration_alert.csv"))
+model27 <- safe_fread(file.path(TABLE_DIR, "model_27_final_stage3_status.csv"))
+
+train_row  <- pick_row(tbl01, "split", "training")
+future_row <- pick_row(tbl01, "split", "future")
+tbl12_train  <- pick_row(tbl12, "period", "train|Sep")
+tbl12_future <- pick_row(tbl12, "period", "future|Nov")
+```
+
+```{r load-phase2}
+fe07 <- safe_fread(file.path(TABLE_DIR, "fe_07_final_feature_decision.csv"))
+db02 <- safe_fread(file.path(TABLE_DIR, "db_02_return_rate_by_split.csv"))
+leaderboard <- safe_fread(file.path(TABLE_DIR, "model_zoo_01_leaderboard.csv"))
+zoo_failures <- safe_fread(file.path(TABLE_DIR, "model_zoo_02_failures.csv"))
+tune05 <- safe_fread(file.path(TABLE_DIR, "tune_05_baseline_vs_tuned.csv"))
+final_selection <- safe_fread(file.path(TABLE_DIR, "model_final_selection.csv"))
+auc_bootstrap <- safe_fread(file.path(TABLE_DIR, "model_auc_paired_bootstrap.csv"))
+
+top_model_row <- if (!is.null(leaderboard)) leaderboard[order(-auc)][1] else data.table()
+n_models_fit <- if (!is.null(leaderboard)) nrow(leaderboard) else NA
+n_models_failed <- if (!is.null(zoo_failures)) nrow(zoo_failures) else NA
+selected_models <- character(0)
+if (!is.null(final_selection) && "selected" %in% names(final_selection)) {
+  sel_col <- if ("label" %in% names(final_selection)) "label" else "model_id"
+  selected_models <- final_selection[selected == TRUE][[sel_col]]
+}
+```
+
+```{r load-phase3}
+p3_01 <- safe_fread(file.path(TABLE_DIR, "p3_01_calibration_comparison.csv"))
+p3_02 <- safe_fread(file.path(TABLE_DIR, "p3_02_global_crc_thresholds.csv"))
+p3_04 <- safe_fread(file.path(TABLE_DIR, "p3_04_holdout_evaluation.csv"))
+p3_06 <- safe_fread(file.path(TABLE_DIR, "p3_06_subgroup_burden_gaps.csv"))
+p3_07 <- safe_fread(file.path(TABLE_DIR, "p3_07_drift_summary.csv"))
+p3_08 <- safe_fread(file.path(TABLE_DIR, "p3_08_future_test_evaluation.csv"))
+p3_09 <- safe_fread(file.path(TABLE_DIR, "p3_09_recalibration_alert.csv"))
+p3_10 <- safe_fread(file.path(TABLE_DIR, "p3_10_final_policy_comparison.csv"))
+s10_04 <- safe_fread(file.path(TABLE_DIR, "s10_04_significance_summary.csv"))
+
+alpha_focus <- 0.05  # the alpha level used throughout this report for headline comparisons, matching Stage 3/9's own focus
+
+hold_xgb <- if (!is.null(p3_04)) p3_04[model_id == "xgboost" & alpha == alpha_focus] else data.table()
+hold_en  <- if (!is.null(p3_04)) p3_04[model_id == "elastic_net_logistic" & alpha == alpha_focus] else data.table()
+```
+
+# Executive summary
+
+CostConformal-Return turns ASOS's return-prediction benchmark into a value-sensitive decision policy, not just a classifier. Instead of asking "will this order be returned," it asks: given a calibrated return probability, at what point should the platform intervene so the value-weighted exposure of missed returns stays below a chosen target, with a distribution-free statistical guarantee (Conformal Risk Control) rather than a hand-picked cutoff.
+
+The project ran three phases. Phase 1 built the data pipeline, preprocessing, exploratory analysis, and a first CRC implementation around a single baseline logistic regression. Phase 2 engineered and selected features, stood up a SQLite database layer, trained and tuned `r if (!is.na(n_models_fit)) n_models_fit else "14-15"` machine-learning algorithms, and selected `r if (length(selected_models) > 0) paste(selected_models, collapse = " and ") else "the best-performing models"` to carry forward. Phase 3 brought those selected models through the same CRC machinery Phase 1 established -- independent calibration, global and category-aware thresholds, subgroup burden auditing, future-period drift auditing, and a statistically-grounded final comparison between the two candidates.
+
+# Phase 1: data, preprocessing, and the first CRC implementation
+
+## Dataset
+
+The benchmark covers `r fmt_num(cell(tbl01, train_row, "event_rows"), 0)` purchase events in the official training period (Sep-Oct 2021) and `r fmt_num(cell(tbl01, future_row, "event_rows"), 0)` in the official future-test period (Oct-Nov 2021), at a return rate of `r fmt_pct(cell(tbl01, train_row, "return_rate")/100)` and `r fmt_pct(cell(tbl01, future_row, "return_rate")/100)` respectively. Every customer in the release has at least one return -- this is a known selection bias in the benchmark, so these rates describe the dataset, not the true ASOS-wide return prevalence, and this caveat is carried through the whole report.
+
+Product-side join coverage is materially lower than customer-side coverage (roughly two-thirds vs. about 95%), which is why a left join with explicit `*_node_found` indicator flags was used throughout rather than an inner join that would have silently discarded about a third of the data.
+
+## Exploratory findings that shaped the modelling choices
+
+Return rate varies sharply by product category -- see `09_return_rate_by_product_type.csv` for the full category-by-category breakdown with Wilson confidence intervals. That spread is the direct motivation for the category-aware CRC extension built in both Phase 1 and Phase 3: a single global threshold calibrated to the overall rate is a poor fit at either end of that range. Return rate also shifted modestly between the training and future-test periods (`r fmt_pct(cell(tbl12, tbl12_train, "return_rate")/100)` vs. `r fmt_pct(cell(tbl12, tbl12_future, "return_rate")/100)`) -- small in magnitude, but exactly the kind of shift the future-period drift audit (both in Phase 1 and repeated for the Phase 3 models) is designed to catch.
+
+## Phase 1's baseline CRC implementation
+
+A single logistic regression, fit on `model_train`, was calibrated (`r if (!is.null(model01)) model01[order(brier)][1, method] else "[pending]"` was selected by lowest validation Brier score) and run through CRC at five target levels (alpha = 0.01, 0.025, 0.05, 0.075, 0.10). The CRC guarantee held on `iid_holdout` at every alpha tested. On the genuinely future-dated `official_future_test` split, the target was missed narrowly at alpha = 0.05 -- a finding the project's own pre-registered recalibration-alert rule (PSI \> 0.25 or a missed risk target on the future period) correctly flagged, with `recalibration_recommended` coming back `r if (!is.null(model11)) model11$recalibration_recommended[1] else "[pending]"`. This is the direct motivation for Phase 3: better, Phase-2-selected models were carried through the same CRC pipeline to see whether this miss persists.
+
+# Phase 2: feature engineering, the model zoo, tuning, and selection
+
+## Feature engineering and selection
+
+Five engineered features and two frozen-breakpoint bins were added to Stage 1.5's base feature set, then passed through a five-step filter-to-embedded selection pipeline (near-zero-variance, pairwise correlation, VIF, LASSO, Random Forest importance), fit exclusively on `model_train`. This produced two separate final feature lists -- one for linear/distance models, one for tree/boosting models -- because the two families tolerate collinearity differently (a lesson learned directly from a rank-deficient GLM encountered during Phase 1 debugging).
+
+## The model zoo
+
+`r if (!is.na(n_models_fit)) n_models_fit else "14-15"` algorithms were fit, spanning regularized linear models, a lazy distance-based learner (KNN), tree ensembles, and gradient-boosting frameworks. `r if (!is.na(n_models_failed) && n_models_failed > 0) paste(n_models_failed, "model(s) failed to fit") else "No models failed to fit"` (see `model_zoo_02_failures.csv` for the reason, where applicable) -- every failure was caught and logged rather than halting the run, consistent with the project's error-handling design. The top-ranked baseline model by validation AUC was `r if (nrow(top_model_row) > 0) top_model_row$model_id else "[pending]"`, at AUC `r fmt_num(cell(leaderboard, top_model_row, "auc"))`.
+
+## Hyperparameter tuning
+
+Four models with a genuine bias-variance lever (Elastic-Net's alpha, KNN's k, Random Forest's mtry/min.node.size, XGBoost's max_depth/eta with early-stopped nrounds) were tuned via small, explicit grid searches against validation. See `tune_05_baseline_vs_tuned.csv` for the before/after comparison; several optima landed on grid boundaries, which is flagged as a limitation below rather than overstated as a converged result.
+
+## Final Phase-2 selection
+
+Using a paired bootstrap (200 replicates) over AUC and a pre-registered selection margin (0.005 AUC), Phase 2 selected `r if (length(selected_models) > 0) paste(selected_models, collapse = " and ") else "[pending]"` to carry into Phase 3. This decision was made on validation, a split then permanently retired from any further use, including the calibration and CRC work in Phase 3.
+
+# Phase 3: calibration, Conformal Risk Control, and the final statistical comparison
+
+Phase 3 re-ran the full CRC pipeline -- independent calibration, global CRC thresholds, category-aware thresholds, subgroup burden auditing, and future-period drift auditing -- for both Phase-2-selected models, using `crc_calibration` for calibration and threshold selection, `iid_holdout` for a genuinely held-out evaluation, and `official_future_test` for the drift audit. `validation` was not reused for any of this.
+
+## Calibration
+
+```{r phase3-calibration-table}
+if (!is.null(p3_01)) knitr::kable(p3_01[, .(model_id, method, brier)], digits = 5,
+                                   caption = "Calibration method comparison (lower Brier is better) on crc_calibration") else
+  cat("[p3_01_calibration_comparison.csv not yet available]")
+```
+
+## Global CRC thresholds and the holdout check
+
+```{r phase3-global-crc-table}
+if (!is.null(p3_02)) knitr::kable(p3_02[, .(model_id, alpha, tau, calibration_intervention_rate, feasible)], digits = 5,
+                                   caption = "CRC thresholds selected on crc_calibration") else
+  cat("[p3_02_global_crc_thresholds.csv not yet available]")
+```
+
+```{r phase3-holdout-table}
+if (!is.null(p3_04)) knitr::kable(p3_04[, .(model_id, alpha, holdout_risk, holdout_intervention_rate, risk_target_met_on_holdout)], digits = 5,
+                                   caption = "Genuinely held-out evaluation on iid_holdout") else
+  cat("[p3_04_holdout_evaluation.csv not yet available]")
+```
+
+At the project's focus level (alpha = `r alpha_focus`): XGBoost's holdout risk was `r fmt_num(cell(p3_04, hold_xgb, "holdout_risk"))` and Elastic-Net's was `r fmt_num(cell(p3_04, hold_en, "holdout_risk"))`, against a target of `r alpha_focus`.
+
+## Subgroup burden
+
+```{r phase3-subgroup-table}
+if (!is.null(p3_06)) knitr::kable(p3_06, digits = 5, caption = "Intervention-burden gaps by subgroup, both models (diagnostic only)") else
+  cat("[p3_06_subgroup_burden_gaps.csv not yet available]")
+```
+
+This audit is diagnostic, not punitive, per the project's own stated design: it exists to surface whether the intervention workload or missed-return exposure falls disproportionately on any customer group, not to adjust the policy automatically.
+
+## Future-period drift audit
+
+```{r phase3-drift-table}
+if (!is.null(p3_07)) knitr::kable(p3_07[, .(model_id, variable, psi, psi_flag)], digits = 5,
+                                   caption = "PSI drift flags (operational threshold 0.25, not a formal guarantee)") else
+  cat("[p3_07_drift_summary.csv not yet available]")
+```
+
+```{r phase3-recal-alert}
+if (!is.null(p3_09)) knitr::kable(p3_09, caption = "Recalibration alert, both models (pre-registered rule: PSI > 0.25 OR risk target missed on future_test)") else
+  cat("[p3_09_recalibration_alert.csv not yet available]")
+```
+
+## The headline comparison
+
+```{r phase3-policy-comparison-table}
+if (!is.null(p3_10)) knitr::kable(p3_10, digits = 5, caption = "XGBoost vs. Elastic-Net: value-weighted CRC risk and intervention rate, every alpha, both splits") else
+  cat("[p3_10_final_policy_comparison.csv not yet available]")
+```
+
+## Statistical significance of the comparison
+
+Point estimates alone don't establish that one model actually outperforms the other -- Stage 10's paired bootstrap answers that directly.
+
+```{r phase3-significance-table}
+#| results: asis
+if (!is.null(s10_04)) {
+  # print() is required here: a kable() that is not the last expression of a
+  # braced block is evaluated but never displayed.
+  print(knitr::kable(s10_04, digits = 5, caption = "95% bootstrap CI of (XGBoost − Elastic-Net); 'significant' = CI excludes zero"))
+  n_sig <- sum(s10_04$significant, na.rm = TRUE)
+  cat("\n\n**", n_sig, " of ", nrow(s10_04), " alpha/metric/split combinations show a statistically significant difference.**\n", sep = "")
+} else {
+  cat("[s10_04_significance_summary.csv not yet available -- run Stage 10 before finalizing this report's conclusion]")
+}
+```
+
+# Result interpretation and discussion
+
+**Does value-weighting change which model should actually run this policy, versus what AUC alone would suggest?** Phase 2 selected `r if (length(selected_models) > 0) paste(selected_models, collapse = " and ") else "[pending]"` on AUC. Phase 3's headline comparison (p3_10, above) is the honest test of whether that AUC-based ranking actually translates into a better value-weighted outcome -- they are not guaranteed to agree, since AUC is rank-based and threshold-free, while the CRC policy's risk is a weighted, threshold-dependent quantity. Where Stage 10 finds the difference is not statistically significant, the right conclusion is that the two models are interchangeable for this policy at this sample size, not that the higher-point-estimate model is definitively better -- see the significance table above for exactly which alpha/metric/split combinations do and do not clear that bar.
+
+**Did the future-period risk miss found in Phase 1 (alpha = 0.05, baseline logistic regression) recur with the better Phase-2 models?** Compare p3_09's `risk_target_missed_on_future_test` flag, above, against Phase 1's `model_11_recalibration_alert.csv` result. If the miss persists even with materially better classifiers, that is evidence the issue is a genuine distributional shift between the training and future periods rather than simply a weak baseline model being unable to track it -- worth stating explicitly rather than assuming better AUC automatically fixes threshold-level risk control.
+
+**Is the category-aware extension still earning its place with the better models?** The product-category return-rate spread that motivated it in Phase 1 (`09_return_rate_by_product_type.csv`) is a property of the data, not of any one model, so it should still matter here -- compare `p3_03_category_crc_thresholds.csv`'s per-category thresholds against the global thresholds in p3_02 to see how much they diverge for the Phase-3 models.
+
+# Limitations
+
+- **Selection bias in the benchmark itself.** Every customer in the released sample has at least one return, so every return-rate figure in this report describes the benchmark sample, not true ASOS-wide behavior. This is not something any modelling choice downstream can correct.
+- **No event IDs or timestamps in the released data.** Repeated (customer, variant, label) triplets could not be distinguished from genuine repeat purchases and were retained rather than dropped (an unjustified assumption either way); the future-period drift audit compares two fixed periods rather than supporting true rolling monitoring.
+- **`validation` was used for both model selection (Phase 2) and hyperparameter tuning**, so Phase 2's own validation-based metrics are mildly optimistic by construction -- this is exactly why Phase 3 switched to `crc_calibration`/`iid_holdout`/`future_test` for anything evaluative, rather than reusing `validation` a third time.
+- **KNN and SVM were deliberately undersized** relative to the rest of the model zoo (RAM-driven: `kknn`'s distance computation and `libsvm`'s probability calibration both scale badly), so their leaderboard position should not be read as a fair, apples-to-apples comparison against the full-sample models.
+- **Random Forest and KNN have no feature-importance output** -- `ranger()` was never fit with `importance=` enabled at the scale/time budget available, and KNN has no global importance concept as a lazy learner. This is a genuine gap in what was saved, not an oversight in the final report.
+- **Several Stage 7 tuning optima sat on grid boundaries** (KNN's k, XGBoost's max_depth/eta, Random Forest's mtry/min.node.size) -- the grids were deliberately kept small for compute reasons, so a wider search might still find further gains the current results don't rule out.
+- **PSI's 0.25 flag threshold and the 0.005 AUC selection margin are both operational judgment calls**, stated as such throughout rather than presented as formal guarantees -- only the CRC risk-control claim itself carries a formal, distribution-free guarantee (under exchangeability), and only with respect to `crc_calibration` and `iid_holdout`, not the future-test period.
+- **The entire pipeline was built and run under an explicit 6 GB RAM budget**, which drove every sample-size cap documented throughout Stages 4-10 (stratified training pools, capped bootstrap replicate counts, one-split-at-a-time loading). These were deliberate, documented trade-offs, but they are trade-offs: a less memory-constrained environment could likely tighten several of the confidence intervals reported here.
+- **XGBoost scoring in Phase 3 is done in pure R.** On the ARM (aarch64) machine used, xgboost's native predict rejected every input matrix, so the tuned booster's trees were read from its `.ubj` file and scored directly in R. The scorer was written for this project and is not part of the xgboost package; its AUC on `crc_calibration` should be (and was meant to be) checked against the Stage 8 figure for the same model.
+
+# Future scope
+
+- Wider hyperparameter search for the four tuned models, and tuning additional candidates (GBM, LightGBM) that were only run at default settings in Stage 6.
+- A genuine client-server database port (the project used SQLite by design, for a server-free environment; swapping the DBI driver to RPostgres/RMariaDB would need minimal code change given how Stage 5 was built).
+- An interactive dashboard (Plotly/Shiny/Tableau/Power BI) exposing the CRC threshold trade-off interactively -- explicitly out of scope for this report at the user's request, but the p3_02/p3_10 tables are already in the right shape to drive one directly.
+- Fairness-aware threshold adjustment, directly motivated by whatever gaps p3_06's subgroup audit actually found -- the current audit is diagnostic only, by design; turning its findings into an adjusted policy would be a natural, well-scoped extension.
+- Real timestamped data, if ASOS or a similar partner ever released it, would upgrade the future-period drift audit from a two-period comparison into genuine rolling monitoring, and would let repeated (customer, variant, label) triplets actually be resolved instead of conservatively retained.
+- A/B testing the resulting policy in production before fully trusting the offline CRC guarantee's practical impact on actual return costs.
+
+# Conclusion
+
+CostConformal-Return set out to answer a more useful question than plain return prediction: not just *will this order be returned*, but *at what point should the platform act*, with a mathematically grounded bound on the value it will miss by not acting. Phase 1 built that framework and a first working policy around a single baseline model. Phase 2 systematically searched for a better classifier across `r if (!is.na(n_models_fit)) n_models_fit else "14-15"` algorithms rather than assuming the baseline was good enough. Phase 3 closed the loop by asking the harder, more honest question: does a better classifier by AUC actually translate into a better value-weighted, statistically-defensible risk-control policy -- and the answer, reported transparently above rather than asserted, is `r if (!is.null(s10_04)) paste0(sum(s10_04$significant, na.rm = TRUE), " significant difference(s) out of ", nrow(s10_04), " comparisons tested") else "[pending Stage 10]"`.
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,2 @@
+stage,baseline_model_valid,predictions_valid,calibration_completed,crc_completed,category_crc_completed,subgroup_audit_completed,future_drift_audit_completed,formal_crc_targets_all_met,recalibration_recommended,overall_stage3_pass
+Stage 3,TRUE,TRUE,TRUE,TRUE,TRUE,TRUE,TRUE,TRUE,TRUE,TRUE

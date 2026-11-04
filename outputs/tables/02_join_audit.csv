@@ -1,0 +1,3 @@
+split,rows,customer_match_rate,product_match_rate,complete_match_rate
+official_training,1369133,0.947669072325333,0.653364574515405,0.619701665214409
+official_future_test,1460366,0.948640272370077,0.69065426064425,0.657896034281817

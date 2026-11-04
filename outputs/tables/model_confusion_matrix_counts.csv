@@ -1,0 +1,9 @@
+model_id,Actual,Predicted,N,label
+elastic_net_logistic,Retained,Retained,63748,Elastic-Net
+elastic_net_logistic,Returned,Retained,26193,Elastic-Net
+elastic_net_logistic,Retained,Returned,27814,Elastic-Net
+elastic_net_logistic,Returned,Returned,87677,Elastic-Net
+xgboost,Retained,Retained,61477,XGBoost
+xgboost,Returned,Retained,23485,XGBoost
+xgboost,Retained,Returned,30085,XGBoost
+xgboost,Returned,Returned,90385,XGBoost

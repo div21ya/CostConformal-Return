@@ -1,0 +1,10 @@
+feature,breakpoint
+price_tier,-Inf
+price_tier,16.25
+price_tier,19.7
+price_tier,24.38
+price_tier,Inf
+customer_risk_tier,-Inf
+customer_risk_tier,0.4
+customer_risk_tier,0.666666666666667
+customer_risk_tier,Inf

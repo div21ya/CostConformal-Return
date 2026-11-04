@@ -1,0 +1,546 @@
+---
+title: "CostConformal-Return — Stage 4: Feature Engineering and Selection"
+subtitle: "Category-Aware and Future-Period Drift-Audited Conformal Risk Control for Value-Sensitive E-Commerce Returns"
+author: "Simran Kumari (24BDS1031)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    df-print: kable
+    theme: cosmo
+execute:
+  warning: false
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath("."))
+```
+
+# Purpose of this stage
+
+This notebook opens **Phase 2** of the project and is **Stage 4** of the pipeline. It picks up directly from Stage 1.5's preprocessed splits (`*_prep.csv.gz`) and does two things, in order:
+
+1.  **Feature engineering** — a small number of new, economically-motivated features built from columns Stage 1 already produced (interactions, ratios, a log-price term, and two frozen-breakpoint bins). No new external data is introduced; nothing here uses a row's own outcome or any future-period information.
+2.  **Feature selection** — a filter → embedded pipeline (near-zero-variance, pairwise correlation, Variance Inflation Factor, LASSO, and Random-Forest importance) that decides, with evidence, which features earn a place in the Stage 6 model zoo.
+
+Everything here is fit **only on `model_train`** and applied unchanged to every other split — the same discipline Stage 1.5 established for medians, category levels, and normalization parameters.
+
+**Decision carried over from Stage 3, formalized here:** `value_exposure` is the CRC **policy loss weight**, not a classifier input (project report, §5). It is excluded from every candidate feature list from the start and carried through as a pass-through column only.
+
+**Decision carried over from Stage 3, generalized here:** `type_median_price` was exactly collinear with `productType`'s dummies for linear models. Rather than drop it globally, this stage produces **two** feature lists — `linear_features` (VIF-screened) and `tree_features` (keeps collinear-but-informative features, since trees handle collinearity natively).
+
+## This revision's two fixes
+
+**(a) A real duplicate-memory bug, not just a naming choice.** The previous draft used `list2env()` to flatten the engineered splits back into globals named `model_train`/`validation`/etc., while the raw, pre-engineering objects stayed around under their original `*_prep` names — two full copies of the same table, simultaneously, for no reason. This revision keeps exactly **one** name per split in memory at any time: `model_train` throughout, with the other four splits never all loaded together (see "Memory profile" below).
+
+**(b) `product_customer_risk_gap` is exactly collinear with features already in the candidate pool** — it is defined as `productReturnRate − customerReturnRate`, and both of those remain candidates in their own right. This is mechanically the same disease as Stage 3's `type_median_price`/`productType` alias. The VIF step below (now a plain, dependency-free `1/(1-R^2)` calculation) catches this automatically: a feature that is an exact linear combination of others gets VIF = `Inf` and is dropped first, with no separate alias pre-check needed.
+
+## Memory profile (6 GB RAM)
+
+This stage is written to run inside a tight RAM budget. Concretely:
+
+- **Only one split is ever fully loaded at once.** Phase A fits engineering/binning/selection on `model_train` alone; Phase B re-reads, transforms, and writes each of the five splits **one at a time**, calling `rm()` + `gc()` between each. `future_test` (1.46M rows) is never loaded until every other split has already been written and freed.
+- **No `car` dependency.** `car::vif()`'s install chain (`lme4` → `quantreg` → `Matrix`/`RcppEigen`) is exactly what broke the R 4.2.2 install earlier in this project. VIF is recomputed here as a direct `1/(1-R^2)` regression — six lines, zero extra dependencies, and mathematically identical for a model with only continuous predictors (which is all the VIF step ever used it for).
+- **Capped, documented subsamples** for the two heaviest fits: `cv.glmnet` (100k rows, 3-fold, not 250k/5-fold) and `ranger` (100k rows, 150 trees, `write.forest = FALSE` since only `$variable.importance` is needed — this alone avoids storing 150 full tree structures in memory).
+- **Explicit `gc()`** after each heavy fit and before Phase B begins.
+
+If you still run out of memory after this, the next lever to pull is shrinking `LASSO_SAMPLE_N`/`RF_SAMPLE_N` further (e.g. to 50,000) — tell me the exact error and I'll adjust.
+
+# Before you render this document
+
+1.  Save this file as `04_feature_engineering.qmd` in the project root.
+2.  Confirm Stage 1.5's checklist is fully green — the five `data/processed/*_prep.csv.gz` files and `models/r_preprocessor.rds` must already exist.
+3.  This stage needs only `glmnet` and `ranger` (auto-installed below if missing) — `car` is no longer required.
+4.  Render with `Ctrl/Cmd+Shift+K`, or run chunk-by-chunk.
+
+# Setup and data loading
+
+```{r source-setup}
+source(file.path("R", "00_setup.R"))
+
+# RAM-conscious settings for a 6 GB machine: cap data.table's own thread
+# pool (each thread adds working-memory overhead for large operations) and
+# force a garbage collection right after loading, before any big object is
+# created.
+data.table::setDTthreads(2)
+
+required_packages <- c("glmnet", "ranger")
+missing_packages <- setdiff(required_packages, rownames(installed.packages()))
+if (length(missing_packages) > 0) install.packages(missing_packages)
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+# Compute/memory budget for this stage -- adjust here if a step still OOMs.
+LASSO_SAMPLE_N <- 100000
+LASSO_NFOLDS <- 3
+VIF_SAMPLE_N <- 150000
+RF_SAMPLE_N <- 100000
+RF_NUM_TREES <- 150
+RF_NUM_THREADS <- 2
+```
+
+```{r file-paths}
+preprocessed_files <- c(
+  model_train = file.path(PROCESSED_DIR, "model_train_prep.csv.gz"),
+  validation = file.path(PROCESSED_DIR, "validation_prep.csv.gz"),
+  crc_calibration = file.path(PROCESSED_DIR, "crc_calibration_prep.csv.gz"),
+  iid_holdout = file.path(PROCESSED_DIR, "iid_holdout_prep.csv.gz"),
+  future_test = file.path(PROCESSED_DIR, "official_future_test_prep.csv.gz")
+)
+preprocessor_file <- file.path(MODEL_DIR, "r_preprocessor.rds")
+
+# Cheap check (file.exists only, nothing loaded into memory yet) -- fail
+# fast on a missing path before Phase A does any real work.
+assert_files_exist(c(preprocessed_files, preprocessor = preprocessor_file))
+preprocessor <- readRDS(preprocessor_file)
+
+NUMERIC_FEATURES <- names(preprocessor$medians)
+CATEGORICAL_FEATURES <- names(preprocessor$allowed_levels)
+BINARY_FEATURES <- c("isMale", "premier")
+MISSINGNESS_FLAGS <- c("customer_missing", "product_missing")
+
+# fwrite()/fread() round-tripping doesn't preserve factor type (same note as
+# Stage 3) -- restore it with the exact training-time level set.
+restore_factor_types <- function(dt, preproc) {
+  for (col in names(preproc$allowed_levels)) {
+    if (col %in% names(dt)) {
+      levs <- union(preproc$allowed_levels[[col]], "OTHER")
+      set(dt, j = col, value = factor(dt[[col]], levels = levs))
+    }
+  }
+  dt
+}
+
+# Pure functions used in both Phase A (fitting) and Phase B (applying to
+# every split) -- defined once here so the two phases can never drift apart.
+add_engineered_features <- function(dt) {
+  # price_discount_interaction: is a heavily-discounted item priced far from
+  # what's typical for its type?
+  dt[, price_discount_interaction := price_to_type_median * discount_ratio]
+  # customer_value_at_risk: expected cost-weighted historical
+  # return-proneness of this customer. NOT leakage: customerReturnRate is
+  # Stage 1's pre-computed historical aggregate, value_exposure is
+  # price-derived -- neither uses this row's own outcome.
+  dt[, customer_value_at_risk := value_exposure * customerReturnRate]
+  # product_customer_risk_gap: does this product return far more/less than
+  # this customer typically does? NOTE: this is *why* it later shows up
+  # with VIF = Inf -- it is an exact linear combination of
+  # productReturnRate and customerReturnRate, both of which remain
+  # candidates in their own right. It is expected to be dropped from
+  # linear_features by the VIF step, and that is the correct, intended
+  # behavior, not a bug to chase.
+  dt[, product_customer_risk_gap := productReturnRate - customerReturnRate]
+  # log_price: raw price on a log scale (log_sales/log_returns already
+  # existed; the price level itself did not).
+  dt[, log_price := log1p(avgGbpPrice)]
+  # male_premier: interaction of the two binary customer attributes.
+  dt[, male_premier := isMale * premier]
+  dt
+}
+
+ENGINEERED_FEATURES <- c(
+  "price_discount_interaction", "customer_value_at_risk",
+  "product_customer_risk_gap", "log_price", "male_premier"
+)
+
+apply_bins <- function(dt, bins) {
+  price_labels <- c("Q1_low", "Q2", "Q3", "Q4_high")[seq_len(length(bins$price_breaks) - 1)]
+  risk_labels <- c("Low", "Mid", "High")[seq_len(length(bins$risk_breaks) - 1)]
+  dt[, price_tier := cut(avgGbpPrice, breaks = bins$price_breaks, labels = price_labels, include.lowest = TRUE)]
+  dt[, customer_risk_tier := cut(customerReturnRate, breaks = bins$risk_breaks, labels = risk_labels, include.lowest = TRUE)]
+  dt
+}
+BINNED_FEATURES <- c("price_tier", "customer_risk_tier")
+
+CANDIDATE_NUMERIC <- setdiff(c(NUMERIC_FEATURES, ENGINEERED_FEATURES), "value_exposure")
+cat(length(CANDIDATE_NUMERIC), "candidate numeric features will enter selection.\n")
+```
+
+# Phase A — fit engineering, bins, and feature selection on `model_train` only
+
+Only `model_train` is loaded for all of Phase A. The other four splits are not read until Phase B, after everything fit here has been reduced to small, saveable objects (lists of feature names, bin breakpoints) and the big table itself has been freed.
+
+```{r phase-a-load-train}
+model_train <- fread(preprocessed_files[["model_train"]])
+model_train <- restore_factor_types(model_train, preprocessor)
+model_train <- add_engineered_features(model_train)
+cat("model_train loaded + engineered:", nrow(model_train), "rows.\n")
+```
+
+## Frozen-breakpoint bins (fit on `model_train` only)
+
+```{r fit-bins}
+fit_bins <- function(dt) {
+  price_breaks <- quantile(dt$avgGbpPrice, probs = seq(0, 1, 0.25), na.rm = TRUE)
+  price_breaks[1] <- -Inf; price_breaks[length(price_breaks)] <- Inf
+  risk_breaks <- quantile(dt$customerReturnRate, probs = seq(0, 1, 1 / 3), na.rm = TRUE)
+  risk_breaks[1] <- -Inf; risk_breaks[length(risk_breaks)] <- Inf
+  list(price_breaks = unique(price_breaks), risk_breaks = unique(risk_breaks))
+}
+
+bin_definitions <- fit_bins(model_train)
+model_train <- apply_bins(model_train, bin_definitions)
+
+fwrite(
+  data.table(
+    feature = c(rep("price_tier", length(bin_definitions$price_breaks)),
+                rep("customer_risk_tier", length(bin_definitions$risk_breaks))),
+    breakpoint = c(bin_definitions$price_breaks, bin_definitions$risk_breaks)
+  ),
+  file.path(TABLE_DIR, "fe_01_bin_breakpoints.csv")
+)
+```
+
+## Step 1 — Near-zero-variance filter
+
+```{r nzv-filter}
+nzv_check <- rbindlist(lapply(CANDIDATE_NUMERIC, function(col) {
+  x <- model_train[[col]]
+  tab <- sort(table(x), decreasing = TRUE)
+  freq_ratio <- if (length(tab) > 1) tab[1] / tab[2] else Inf
+  pct_unique <- length(tab) / length(x) * 100
+  data.table(feature = col, freq_ratio = as.numeric(freq_ratio), pct_unique = pct_unique)
+}))
+nzv_check[, is_nzv := freq_ratio > 95 & pct_unique < 10]
+
+fwrite(nzv_check, file.path(TABLE_DIR, "fe_02_near_zero_variance.csv"))
+nzv_check[order(-freq_ratio)]
+
+NZV_DROPS <- nzv_check[is_nzv == TRUE, feature]
+cat(if (length(NZV_DROPS) > 0) paste("Dropping:", paste(NZV_DROPS, collapse = ", ")) else "No near-zero-variance features found.", "\n")
+
+surviving_after_nzv <- setdiff(CANDIDATE_NUMERIC, NZV_DROPS)
+rm(nzv_check); invisible(gc(verbose = FALSE))
+```
+
+## Step 2 — Pairwise correlation filter
+
+```{r correlation-filter}
+cor_matrix <- cor(model_train[, ..surviving_after_nzv], use = "pairwise.complete.obs")
+target_cor <- sapply(surviving_after_nzv, function(col) {
+  cor(model_train[[col]], model_train$isReturned, use = "complete.obs")
+})
+
+high_cor_pairs <- which(abs(cor_matrix) > 0.90 & upper.tri(cor_matrix), arr.ind = TRUE)
+
+correlation_pairs_log <- if (nrow(high_cor_pairs) > 0) {
+  rbindlist(lapply(seq_len(nrow(high_cor_pairs)), function(i) {
+    f1 <- rownames(cor_matrix)[high_cor_pairs[i, 1]]
+    f2 <- colnames(cor_matrix)[high_cor_pairs[i, 2]]
+    loser <- if (abs(target_cor[f1]) >= abs(target_cor[f2])) f2 else f1
+    data.table(feature_1 = f1, feature_2 = f2, correlation = cor_matrix[f1, f2],
+               target_cor_1 = target_cor[f1], target_cor_2 = target_cor[f2], dropped = loser)
+  }))
+} else {
+  data.table(feature_1 = character(0), feature_2 = character(0), correlation = numeric(0),
+             target_cor_1 = numeric(0), target_cor_2 = numeric(0), dropped = character(0))
+}
+
+correlation_drops <- unique(correlation_pairs_log$dropped)
+fwrite(correlation_pairs_log, file.path(TABLE_DIR, "fe_03_correlation_pairs_dropped.csv"))
+correlation_pairs_log
+
+surviving_after_cor <- setdiff(surviving_after_nzv, correlation_drops)
+cat(length(correlation_drops), "feature(s) dropped for |r| > 0.90 with a more target-informative partner.\n")
+```
+
+```{r correlation-heatmap}
+cor_long <- as.data.table(as.table(cor_matrix))
+setnames(cor_long, c("feature_1", "feature_2", "correlation"))
+
+p_cor <- ggplot(cor_long, aes(x = feature_1, y = feature_2, fill = correlation)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "#4C72B0", mid = "white", high = "#C44E52", midpoint = 0, limits = c(-1, 1)) +
+  labs(title = "Candidate numeric feature correlation (model_train)", x = NULL, y = NULL, fill = "r") +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 7),
+        axis.text.y = element_text(size = 7))
+p_cor
+save_plot(p_cor, "10_feature_correlation_heatmap.png", height = 8, width = 9)
+
+rm(cor_matrix, cor_long, target_cor, high_cor_pairs); invisible(gc(verbose = FALSE))
+```
+
+## Step 3 — Variance Inflation Factor (VIF), linear-model view only, no `car` dependency
+
+A plain `1/(1-R^2)` VIF: regress each candidate feature on every other candidate feature and read off R². This is mathematically identical to `car::vif()` for a model with only continuous predictors (which is all this step ever needed), and avoids `car`'s heavy, R-version-sensitive dependency chain entirely. Computed on a capped subsample purely to keep each iteration's `lm()` call cheap -- VIF is a property of the predictor correlation structure, not something that needs the full 890k rows to estimate stably.
+
+```{r manual-vif-function}
+manual_vif <- function(data, features) {
+  sapply(features, function(f) {
+    others <- setdiff(features, f)
+    if (length(others) == 0) return(1)
+    probe <- lm(as.formula(paste(f, "~", paste(others, collapse = " + "))), data = data)
+    r2 <- summary(probe)$r.squared
+    # r2 essentially 1 means f is an exact (or near-exact) linear combination
+    # of the others -- e.g. product_customer_risk_gap vs.
+    # productReturnRate/customerReturnRate. VIF = Inf is the correct,
+    # expected signal here; the loop below removes it first automatically.
+    if (r2 >= 0.999999) return(Inf)
+    1 / (1 - r2)
+  })
+}
+```
+
+```{r vif-iterative}
+set.seed(20260917)
+vif_sample <- model_train[sample.int(.N, min(VIF_SAMPLE_N, .N))]
+
+vif_probe_features <- surviving_after_cor
+vif_log <- list()
+iteration <- 0
+
+repeat {
+  iteration <- iteration + 1
+  vifs <- manual_vif(vif_sample, vif_probe_features)
+  vif_log[[iteration]] <- data.table(iteration = iteration, feature = names(vifs), vif = as.numeric(vifs))
+
+  if (max(vifs) <= 10 || length(vif_probe_features) <= 2) break
+  drop_feature <- names(which.max(vifs))
+  cat("Iteration", iteration, "- dropping highest-VIF feature:", drop_feature,
+      "VIF =", max(vifs), "\n")
+  vif_probe_features <- setdiff(vif_probe_features, drop_feature)
+}
+
+vif_history <- rbindlist(vif_log)
+fwrite(vif_history, file.path(TABLE_DIR, "fe_04_vif_iterations.csv"))
+vif_history[iteration == max(iteration)][order(-vif)]
+
+VIF_DROPS <- setdiff(surviving_after_cor, vif_probe_features)
+cat("VIF-driven drop(s), LINEAR feature list only:",
+    if (length(VIF_DROPS) > 0) paste(VIF_DROPS, collapse = ", ") else "none", "\n")
+
+linear_candidate_features <- vif_probe_features
+tree_candidate_features <- surviving_after_cor  # trees keep collinear-but-informative features
+
+rm(vif_sample, vif_log, vif_history); invisible(gc(verbose = FALSE))
+```
+
+## Step 4 — Embedded selection: LASSO path (`cv.glmnet`)
+
+Capped to `r LASSO_SAMPLE_N` rows and `r LASSO_NFOLDS`-fold CV (down from a larger sample/5-fold) -- `cv.glmnet` fits `nfolds + 1` models internally, so this is the single most CV-expensive step in the pipeline.
+
+```{r lasso-selection}
+set.seed(20260917)
+lasso_idx <- sample.int(nrow(model_train), min(LASSO_SAMPLE_N, nrow(model_train)))
+x_train <- as.matrix(model_train[lasso_idx, ..linear_candidate_features])
+y_train <- model_train$isReturned[lasso_idx]
+
+cv_lasso <- cv.glmnet(x_train, y_train, family = "binomial", alpha = 1, nfolds = LASSO_NFOLDS)
+
+lasso_coefs <- as.matrix(coef(cv_lasso, s = "lambda.1se"))
+lasso_table <- data.table(feature = rownames(lasso_coefs), coefficient = lasso_coefs[, 1])[feature != "(Intercept)"]
+lasso_table[, retained_by_lasso := coefficient != 0]
+
+fwrite(lasso_table, file.path(TABLE_DIR, "fe_05_lasso_coefficients.csv"))
+lasso_table[order(-abs(coefficient))]
+
+p_lasso <- ggplot(lasso_table, aes(x = reorder(feature, coefficient), y = coefficient, fill = retained_by_lasso)) +
+  geom_col() + coord_flip() +
+  scale_fill_manual(values = c(`TRUE` = "#4C72B0", `FALSE` = "grey70")) +
+  labs(title = "LASSO coefficients at lambda.1se", subtitle = "Grey = shrunk to exactly zero",
+       x = NULL, y = "Coefficient", fill = "Retained") +
+  theme_minimal(base_size = 11)
+p_lasso
+save_plot(p_lasso, "11_lasso_coefficients.png", height = 7)
+
+rm(x_train, y_train, cv_lasso, lasso_coefs, lasso_idx); invisible(gc(verbose = FALSE))
+```
+
+## Step 5 — Embedded selection: Random Forest importance (`ranger`)
+
+Capped to `r RF_SAMPLE_N` rows, `r RF_NUM_TREES` trees, `write.forest = FALSE` (only `$variable.importance` is needed here -- this is a screening model, not a Stage 6 candidate -- so the full tree structures never need to be stored), and `num.threads = r RF_NUM_THREADS`.
+
+```{r rf-importance}
+set.seed(20260917)
+importance_sample <- if (nrow(model_train) <= RF_SAMPLE_N) {
+  model_train
+} else {
+  frac <- RF_SAMPLE_N / nrow(model_train)
+  model_train[, .SD[sample(.N, size = max(1, round(.N * frac)))], by = isReturned]
+}
+
+rf_formula <- as.formula(paste(
+  "as.factor(isReturned) ~",
+  paste(c(tree_candidate_features, CATEGORICAL_FEATURES, BINARY_FEATURES, BINNED_FEATURES), collapse = " + ")
+))
+
+rf_screen <- ranger(
+  rf_formula, data = importance_sample, num.trees = RF_NUM_TREES,
+  importance = "permutation", probability = TRUE, write.forest = FALSE,
+  num.threads = RF_NUM_THREADS, seed = 20260917
+)
+
+rf_importance <- data.table(feature = names(rf_screen$variable.importance), importance = rf_screen$variable.importance)
+setorder(rf_importance, -importance)
+
+fwrite(rf_importance, file.path(TABLE_DIR, "fe_06_rf_importance.csv"))
+rf_importance
+
+p_rf <- ggplot(rf_importance, aes(x = reorder(feature, importance), y = importance)) +
+  geom_col(fill = "#55A868") + coord_flip() +
+  labs(title = "Random Forest permutation importance (screening model)", x = NULL, y = "Permutation importance") +
+  theme_minimal(base_size = 11)
+p_rf
+save_plot(p_rf, "12_rf_importance_screening.png", height = 8)
+
+rm(importance_sample, rf_screen); invisible(gc(verbose = FALSE))
+```
+
+## Final feature-set decision
+
+```{r final-decision}
+rf_median_importance <- median(rf_importance$importance, na.rm = TRUE)
+
+feature_decision <- rbindlist(lapply(CANDIDATE_NUMERIC, function(f) {
+  retained_lasso <- if (f %in% lasso_table$feature) lasso_table[feature == f, retained_by_lasso] else NA
+  rf_imp <- if (f %in% rf_importance$feature) rf_importance[feature == f, importance] else NA_real_
+  data.table(
+    feature = f,
+    passed_nzv = !(f %in% NZV_DROPS),
+    passed_correlation = !(f %in% correlation_drops),
+    passed_vif = f %in% linear_candidate_features,
+    retained_by_lasso = retained_lasso,
+    rf_importance = rf_imp
+  )
+}))
+
+feature_decision[, in_linear_features :=
+  passed_nzv & passed_correlation & passed_vif & (!is.na(retained_by_lasso) & retained_by_lasso)]
+feature_decision[, in_tree_features :=
+  passed_nzv & passed_correlation & (is.na(rf_importance) | rf_importance >= rf_median_importance)]
+
+fwrite(feature_decision, file.path(TABLE_DIR, "fe_07_final_feature_decision.csv"))
+feature_decision[order(-rf_importance)]
+
+LINEAR_NUMERIC_FEATURES <- feature_decision[in_linear_features == TRUE, feature]
+TREE_NUMERIC_FEATURES <- feature_decision[in_tree_features == TRUE, feature]
+
+cat("Linear-family numeric features (", length(LINEAR_NUMERIC_FEATURES), "):\n",
+    paste(LINEAR_NUMERIC_FEATURES, collapse = ", "), "\n\n")
+cat("Tree/boosting-family numeric features (", length(TREE_NUMERIC_FEATURES), "):\n",
+    paste(TREE_NUMERIC_FEATURES, collapse = ", "), "\n")
+```
+
+## Phase A gate — feature lists themselves, before freeing `model_train`
+
+```{r phase-a-gate}
+cat("\n============================================================\n")
+cat("PHASE A GATE (feature-selection outputs)\n")
+cat("============================================================\n\n")
+
+GATE_PASS <- TRUE
+fail_check <- function(msg) { cat("FAIL:", msg, "\n"); GATE_PASS <<- FALSE }
+pass_check <- function(msg) cat("PASS:", msg, "\n")
+
+if (length(LINEAR_NUMERIC_FEATURES) == 0) fail_check("Zero features survived into linear_features.") else pass_check(paste(length(LINEAR_NUMERIC_FEATURES), "linear features retained."))
+if (length(TREE_NUMERIC_FEATURES) == 0) fail_check("Zero features survived into tree_features.") else pass_check(paste(length(TREE_NUMERIC_FEATURES), "tree features retained."))
+if ("value_exposure" %in% c(LINEAR_NUMERIC_FEATURES, TREE_NUMERIC_FEATURES)) fail_check("value_exposure leaked into a model feature list.") else pass_check("value_exposure correctly excluded from both model feature lists.")
+if (identical(sort(LINEAR_NUMERIC_FEATURES), sort(TREE_NUMERIC_FEATURES))) cat("NOTE: linear and tree feature lists are identical -- double check VIF/LASSO actually ran (expected to differ, e.g. on type_median_price / product_customer_risk_gap).\n")
+
+if (!GATE_PASS) stop("Phase A gate failed -- see FAIL messages above. Do not proceed to Phase B.")
+cat("\nPhase A gate passed.\n")
+```
+
+```{r save-feature-selector}
+feature_selector <- list(
+  bin_definitions = bin_definitions,
+  candidate_numeric = CANDIDATE_NUMERIC,
+  nzv_drops = NZV_DROPS,
+  correlation_drops = correlation_drops,
+  vif_drops = VIF_DROPS,
+  linear_numeric_features = LINEAR_NUMERIC_FEATURES,
+  tree_numeric_features = TREE_NUMERIC_FEATURES,
+  categorical_features = CATEGORICAL_FEATURES,
+  binary_features = BINARY_FEATURES,
+  missingness_flags = MISSINGNESS_FLAGS,
+  binned_features = BINNED_FEATURES,
+  fitted_on_n = nrow(model_train)
+)
+saveRDS(feature_selector, file.path(MODEL_DIR, "r_feature_selector.rds"))
+
+# Free the big table now -- Phase B re-reads every split (including
+# model_train) fresh, one at a time, so nothing from Phase A needs to stay
+# resident.
+rm(model_train, feature_decision, lasso_table, rf_importance, nzv_check)
+invisible(gc(verbose = FALSE))
+cat("Phase A complete. model_train freed from memory before Phase B.\n")
+```
+
+# Phase B — apply the fitted selector to every split, one at a time
+
+Each split is read fresh from disk, transformed with the exact functions/breakpoints fit in Phase A, gated, written, and then discarded before the next one is loaded -- at most one full split is ever resident in memory.
+
+```{r phase-b-loop}
+output_cols <- unique(c(
+  "customer_id", "variant_id", "isReturned", "value_exposure",
+  feature_selector$linear_numeric_features, feature_selector$tree_numeric_features,
+  feature_selector$categorical_features, feature_selector$binary_features,
+  feature_selector$missingness_flags, feature_selector$binned_features
+))
+
+output_file_map <- c(
+  model_train = "model_train_features.csv.gz",
+  validation = "validation_features.csv.gz",
+  crc_calibration = "crc_calibration_features.csv.gz",
+  iid_holdout = "iid_holdout_features.csv.gz",
+  future_test = "official_future_test_features.csv.gz"
+)
+
+for (split_name in names(preprocessed_files)) {
+
+  cat("\n--- Processing split:", split_name, "---\n")
+
+  split_dt <- fread(preprocessed_files[[split_name]])
+  split_dt <- restore_factor_types(split_dt, preprocessor)
+  split_dt <- add_engineered_features(split_dt)
+  split_dt <- apply_bins(split_dt, feature_selector$bin_definitions)
+
+  # Per-split quality check: engineering/binning introduced no NA/Inf.
+  check_cols <- c(ENGINEERED_FEATURES, BINNED_FEATURES)
+  na_counts <- sapply(check_cols, function(col) sum(is.na(split_dt[[col]])))
+  inf_counts <- sapply(check_cols, function(col) if (is.numeric(split_dt[[col]])) sum(is.infinite(split_dt[[col]])) else 0L)
+  if (any(na_counts > 0) || any(inf_counts > 0)) {
+    print(data.table(feature = check_cols, n_na = na_counts, n_inf = inf_counts))
+    stop(paste("Feature engineering introduced NA/Inf values in split:", split_name))
+  }
+
+  # Per-split column-completeness gate.
+  missing_needed <- setdiff(output_cols, names(split_dt))
+  if (length(missing_needed) > 0) {
+    stop(paste(split_name, "is missing required column(s):", paste(missing_needed, collapse = ", ")))
+  }
+  cat("PASS:", split_name, "has every required column, zero NA/Inf introduced.\n")
+
+  fwrite(split_dt[, ..output_cols], file.path(PROCESSED_DIR, output_file_map[[split_name]]), compress = "gzip")
+  cat("Wrote", output_file_map[[split_name]], "(", nrow(split_dt), "rows ).\n")
+
+  rm(split_dt, na_counts, inf_counts)
+  invisible(gc(verbose = FALSE))
+}
+
+cat("\nPhase B complete. All 5 *_features.csv.gz files written, one split at a time.\n")
+```
+
+# Stage 4 checklist — confirm before moving on
+
+- [ ] `outputs/tables/fe_01_bin_breakpoints.csv` through `fe_07_final_feature_decision.csv` all exist
+- [ ] `outputs/figures/10_feature_correlation_heatmap.png`, `11_lasso_coefficients.png`, and `12_rf_importance_screening.png` all exist
+- [ ] `fe_04_vif_iterations.csv` shows `product_customer_risk_gap` (or any other exact-combination feature) dropped with `vif = Inf` at iteration 1 -- this is expected, not an error
+- [ ] `fe_07_final_feature_decision.csv` shows a clear, evidence-backed reason for every feature's inclusion/exclusion from each list
+- [ ] `models/r_feature_selector.rds` exists and `linear_numeric_features` differs from `tree_numeric_features`
+- [ ] `value_exposure` does **not** appear in either feature list
+- [ ] `data/processed/` now contains 5 `*_features.csv.gz` files, written one at a time ("Processing split: ..." appeared 5 times in the console log)
+- [ ] **PHASE A GATE passed** printed before Phase B began
+- [ ] No `car`/`lme4`/`quantreg` install step was needed to render this notebook
+
+Stage 5 (database connectivity) and Stage 6 (the 10–15-model zoo) read `models/r_feature_selector.rds` and these `*_features.csv.gz` files, not the Stage 1.5 `*_prep.csv.gz` files directly.
+
+```{r session-info}
+sessionInfo()
+```

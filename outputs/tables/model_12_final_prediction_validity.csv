@@ -1,0 +1,5 @@
+split,n,raw_prob_na,raw_prob_nonfinite,calibrated_prob_na,calibrated_prob_nonfinite,calibrated_prob_below_0,calibrated_prob_above_1,exposure_na,exposure_nonfinite,exposure_below_0,exposure_above_1
+validation,205432,0,0,0,0,0,0,0,0,0,0
+crc_calibration,136892,0,0,0,0,0,0,0,0,0,0
+iid_holdout,136663,0,0,0,0,0,0,0,0,0,0
+future_test,1460366,0,0,0,0,0,0,0,0,0,0

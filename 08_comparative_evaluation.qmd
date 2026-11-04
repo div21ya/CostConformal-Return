@@ -1,0 +1,546 @@
+---
+title: "Stage 8: Final Model Comparison and Phase-2 Model Selection"
+subtitle: "CostConformal-Return"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    embed-resources: true
+execute:
+  echo: true
+  warning: true
+  message: true
+---
+
+## Objective
+
+Stage 8 consolidates the baseline (Stage 6) and hyperparameter-tuned (Stage 7) results, compares the candidate models on consistent metrics, quantifies the effect of tuning, produces the comparative visuals Phase 2 calls for (ROC, Precision-Recall, confusion matrices, feature importance), and fixes the model candidates carried into Phase 3.
+
+Only the `validation` split is used here. `crc_calibration`, `iid_holdout` and `future_test` are not touched in this stage. Because `validation` was also used for tuning (including XGBoost early stopping), the tuned metrics are mildly optimistic, and Phase 3 must calibrate on `crc_calibration`.
+
+## Setup
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath("."))
+source(file.path("R", "00_setup.R"))
+library(data.table); library(ggplot2); library(DBI); library(RSQLite); library(glmnet)
+# glmnet must be loaded (not just installed) for coef(en_fit$model, ...) below to
+# dispatch to coef.glmnet() -- without it, the bare generic call silently falls
+# through to coef.default(), which doesn't understand a glmnet object and
+# returns nothing usable (this was the cause of the Elastic-Net importance
+# WARN: "'data' must be of a vector type, was 'NULL'").
+data.table::setDTthreads(2)
+set.seed(20260917)
+
+# Settings fixed BEFORE looking at results
+N_BOOT           <- 200     # paired bootstrap replicates
+SELECTION_MARGIN <- 0.005   # keep a full-validation model if within this AUC of the best
+
+FIGURE_DIR <- if (exists("FIGURE_DIR")) FIGURE_DIR else file.path("outputs", "figures")
+dir.create(FIGURE_DIR, showWarnings = FALSE, recursive = TRUE)
+MODEL_ZOO_TUNED_DIR <- file.path(MODEL_DIR, "model_zoo_tuned")
+DB_PATH <- file.path("data", "costconformal_return.sqlite")
+```
+
+```{r helpers}
+# Same metric definition as Stage 7
+compute_metrics <- function(y, p) {
+  p <- pmin(pmax(p, 1e-6), 1 - 1e-6)
+  cls <- as.integer(p >= 0.5)
+  tp <- sum(cls == 1 & y == 1); fp <- sum(cls == 1 & y == 0)
+  tn <- sum(cls == 0 & y == 0); fn <- sum(cls == 0 & y == 1)
+  prec <- if ((tp + fp) == 0) NA_real_ else tp / (tp + fp)
+  rec  <- if ((tp + fn) == 0) NA_real_ else tp / (tp + fn)
+  f1   <- if (is.na(prec) || is.na(rec) || (prec + rec) == 0) NA_real_ else 2 * prec * rec / (prec + rec)
+  data.table(auc = auc_roc(y, p), pr_auc = pr_auc(y, p), brier = brier_score(y, p),
+             log_loss = log_loss(y, p), accuracy = (tp + tn) / length(y),
+             precision = prec, recall = rec, f1 = f1)
+}
+
+# Rank-based AUC, fast enough for bootstrapping.
+# FIX: n1/n0 were plain integers -- on ~205k full-validation rows (n1 ~
+# 113,000, n0 ~ 92,000), n1 * n0 ~ 10.4 billion overflows R's 32-bit integer
+# (max ~2.147 billion), silently producing NA. This was invisible on small
+# samples but guaranteed every one of the 200 bootstrap replicates below to
+# return NA for every full-validation model, which would have crashed
+# quantile() on an all-NA vector. Casting to double before multiplying fixes
+# it the same way auc_roc() itself was fixed earlier in this project --
+# double multiplication doesn't overflow until ~9e15, far beyond this scale.
+fast_auc <- function(y, p) {
+  r <- data.table::frank(p, ties.method = "average")
+  n1 <- as.double(sum(y == 1)); n0 <- as.double(sum(y == 0))
+  (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+# Threshold-swept ROC/PR curve points, used only for the two overlay plots
+# below (not for any AUC number itself -- those come from auc_roc()/fast_auc()).
+roc_curve_points <- function(y, p, n_points = 200) {
+  thresholds <- seq(1, 0, length.out = n_points)
+  rbindlist(lapply(thresholds, function(t) {
+    pred <- as.integer(p >= t)
+    tp <- sum(pred == 1 & y == 1); fp <- sum(pred == 1 & y == 0)
+    tn <- sum(pred == 0 & y == 0); fn <- sum(pred == 0 & y == 1)
+    data.table(threshold = t, tpr = tp / (tp + fn), fpr = fp / (fp + tn))
+  }))
+}
+pr_curve_points <- function(y, p, n_points = 200) {
+  thresholds <- seq(1, 0, length.out = n_points)
+  rbindlist(lapply(thresholds, function(t) {
+    pred <- as.integer(p >= t)
+    tp <- sum(pred == 1 & y == 1); fp <- sum(pred == 1 & y == 0); fn <- sum(pred == 0 & y == 1)
+    data.table(threshold = t,
+               precision = if ((tp + fp) == 0) NA_real_ else tp / (tp + fp),
+               recall = if ((tp + fn) == 0) NA_real_ else tp / (tp + fn))
+  }))
+}
+```
+
+## Load Stage 6 and Stage 7 outputs
+
+```{r load}
+baseline_leaderboard <- fread(file.path(TABLE_DIR, "model_zoo_01_leaderboard.csv"))
+stage7_comparison    <- fread(file.path(TABLE_DIR, "tune_05_baseline_vs_tuned.csv"))
+preds <- fread(file.path(PROCESSED_DIR, "model_zoo_validation_predictions.csv.gz"))
+
+if ("isReturned" %in% names(preds)) {
+  y <- preds$isReturned
+} else {
+  # Defensive fallback only -- preds$isReturned should always exist (Stage 6
+  # writes it). ORDER BY rowid makes the row-order assumption explicit rather
+  # than silently relying on SQLite's insertion-order behavior.
+  con <- DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
+  y <- DBI::dbGetQuery(con, "SELECT isReturned FROM validation ORDER BY rowid")$isReturned
+  DBI::dbDisconnect(con)
+}
+stopifnot(length(y) == nrow(preds))   # row order must match Stage 7's validation order
+cat("Validation rows:", length(y), "| return rate:", round(mean(y), 4), "\n")
+
+models <- data.table(
+  model_id   = c("xgboost", "elastic_net_logistic", "random_forest", "knn"),
+  label      = c("XGBoost", "Elastic-Net", "Random Forest", "KNN"),
+  tuned_col  = c("prob_xgboost_tuned", "prob_elastic_net_logistic_tuned",
+                 "prob_random_forest_tuned", "prob_knn_tuned"),
+  model_path = file.path(MODEL_ZOO_TUNED_DIR,
+                         c("xgboost_tuned.rds", "elastic_net_logistic_tuned.rds",
+                           "random_forest_tuned.rds", "knn_tuned.rds"))
+)
+stopifnot(all(models$tuned_col %in% names(preds)))
+```
+
+## Tuned metrics
+
+Each model is scored on the rows it was actually evaluated on. KNN has probabilities for only a 5,000-row validation subsample; the other three cover the full validation split.
+
+```{r tuned-metrics}
+tuned_metrics <- rbindlist(lapply(seq_len(nrow(models)), function(i) {
+  p <- preds[[models$tuned_col[i]]]
+  keep <- which(!is.na(p))
+  m <- compute_metrics(y[keep], p[keep])
+  m[, `:=`(model_id = models$model_id[i], n_eval = length(keep),
+           evaluated_on = if (length(keep) < length(y)) "validation subsample" else "full validation")]
+  m
+}))
+knitr::kable(tuned_metrics[, .(model_id, n_eval, evaluated_on, auc, pr_auc, brier, log_loss)],
+             digits = 4, caption = "Tuned models, each on its own evaluation rows")
+```
+
+### Like-for-like check on the KNN subsample
+
+```{r common-subset}
+knn_rows <- which(!is.na(preds$prob_knn_tuned))
+common_subset <- rbindlist(lapply(seq_len(nrow(models)), function(i) {
+  m <- compute_metrics(y[knn_rows], preds[[models$tuned_col[i]]][knn_rows])
+  m[, `:=`(model_id = models$model_id[i], n_eval = length(knn_rows))]
+  m
+}))
+knitr::kable(common_subset[, .(model_id, n_eval, auc, pr_auc, brier)], digits = 4,
+             caption = "All four tuned models scored on the same 5,000 rows")
+
+# Was the Stage 6 KNN baseline scored on the same rows?
+knn_baseline_check <- NULL
+if ("prob_knn" %in% names(preds) && any(!is.na(preds$prob_knn))) {
+  kr <- which(!is.na(preds$prob_knn))
+  knn_baseline_check <- data.table(
+    baseline_rows = length(kr), tuned_rows = length(knn_rows),
+    same_rows = identical(kr, knn_rows),
+    baseline_auc_recomputed = auc_roc(y[kr], preds$prob_knn[kr]))
+  print(knn_baseline_check)
+} else {
+  cat("NOTE: no baseline KNN probabilities in the predictions file; cannot verify that the",
+      "Stage 6 KNN baseline used the same rows as the tuned KNN.\n")
+}
+```
+
+## Baseline vs tuned
+
+```{r comparison}
+base_cols <- intersect(c("model_id", "auc", "pr_auc", "brier"), names(baseline_leaderboard))
+base <- baseline_leaderboard[model_id %in% models$model_id, ..base_cols]
+setnames(base, setdiff(base_cols, "model_id"), paste0("baseline_", setdiff(base_cols, "model_id")))
+
+tuned <- tuned_metrics[, .(model_id, tuned_auc = auc, tuned_pr_auc = pr_auc,
+                           tuned_brier = brier, tuned_log_loss = log_loss,
+                           n_eval, evaluated_on)]
+comparison <- merge(base, tuned, by = "model_id")
+comparison <- merge(comparison, stage7_comparison[, .(model_id, hyperparameters)], by = "model_id")
+comparison[, `:=`(auc_delta = tuned_auc - baseline_auc, brier_delta = tuned_brier - baseline_brier)]
+if ("baseline_pr_auc" %in% names(comparison)) comparison[, pr_auc_delta := tuned_pr_auc - baseline_pr_auc]
+comparison <- merge(comparison, models[, .(model_id, label)], by = "model_id")
+setorder(comparison, -tuned_auc)
+
+knitr::kable(comparison[, .(label, baseline_auc, tuned_auc, auc_delta,
+                            baseline_brier, tuned_brier, brier_delta, evaluated_on)],
+             digits = 5, caption = "Baseline vs tuned (KNN is a subsample result)")
+```
+
+## Paired bootstrap on full-validation models
+
+The gaps between the top models are small, so a paired bootstrap (the same resampled rows for every model) gives an interval for each AUC gap to the best model.
+
+```{r bootstrap}
+full_ids <- tuned_metrics[evaluated_on == "full validation"][order(-auc), model_id]
+P <- sapply(full_ids, function(id) preds[[models[model_id == id, tuned_col]]])
+best_id <- full_ids[1]
+n <- length(y)
+
+boot_auc <- matrix(NA_real_, N_BOOT, length(full_ids), dimnames = list(NULL, full_ids))
+for (b in seq_len(N_BOOT)) {
+  idx <- sample.int(n, n, replace = TRUE)
+  for (j in seq_along(full_ids)) boot_auc[b, j] <- fast_auc(y[idx], P[idx, j])
+}
+
+boot_tbl <- rbindlist(lapply(setdiff(full_ids, best_id), function(id) {
+  d <- boot_auc[, best_id] - boot_auc[, id]
+  data.table(model_id = id, best_model = best_id, auc_gap = mean(d),
+             gap_ci_low = quantile(d, 0.025), gap_ci_high = quantile(d, 0.975))
+}))
+knitr::kable(boot_tbl, digits = 5, caption = "AUC gap to the best model, 95% paired-bootstrap interval")
+```
+
+## Final selection
+
+Rule (fixed in advance): a model moves to Phase 3 if it was scored on full validation and its AUC is within `r SELECTION_MARGIN` of the best model. Models evaluated only on the KNN subsample are not eligible.
+
+```{r selection}
+selection <- merge(tuned_metrics[, .(model_id, auc, pr_auc, brier, n_eval, evaluated_on)],
+                   models[, .(model_id, label)], by = "model_id")
+best_auc <- max(selection[evaluated_on == "full validation", auc])
+selection[, delta_vs_best := best_auc - auc]
+selection[, selected := evaluated_on == "full validation" & delta_vs_best <= SELECTION_MARGIN]
+selection[, reason := fifelse(
+  selected & delta_vs_best == 0, "Highest validation AUC",
+  fifelse(selected, paste0("Within ", SELECTION_MARGIN, " AUC of best; distinct model family"),
+          fifelse(evaluated_on != "full validation",
+                  "Evaluated on 5,000-row subsample only and far below the others; excluded from Phase 3",
+                  "More than the selection margin below best")))]
+selection <- merge(selection, boot_tbl[, .(model_id, gap_ci_low, gap_ci_high)], by = "model_id", all.x = TRUE)
+setorder(selection, -auc)
+knitr::kable(selection[, .(label, auc, delta_vs_best, gap_ci_low, gap_ci_high, selected, reason)],
+             digits = 5, caption = "Phase-2 model selection (validation only)")
+```
+
+## How flat were the tuning grids?
+
+```{r tuning-summary}
+grid_files <- c(elastic_net_logistic = "tune_01_elastic_net_grid.csv", knn = "tune_02_knn_grid.csv",
+                random_forest = "tune_03_random_forest_grid.csv", xgboost = "tune_04_xgboost_grid.csv")
+tuning_summary <- rbindlist(lapply(names(grid_files), function(m) {
+  g <- fread(file.path(TABLE_DIR, grid_files[[m]]))
+  data.table(model_id = m, n_configs = nrow(g), best_auc = max(g$auc), worst_auc = min(g$auc),
+             auc_range_across_grid = max(g$auc) - min(g$auc))
+}))
+tuning_summary <- merge(tuning_summary, comparison[, .(model_id, hyperparameters)], by = "model_id")
+knitr::kable(tuning_summary, digits = 5,
+             caption = "AUC spread across each Stage 7 grid (small spread = flat response)")
+```
+
+## Comparative figures: dot plots
+
+Dot plots are used for the metric comparisons because the AUC values differ in the third decimal; bars starting at zero would hide the differences. KNN is marked with an asterisk because it is scored on a subsample.
+
+```{r figure-helpers}
+plot_dt <- merge(tuned_metrics, models[, .(model_id, label)], by = "model_id")
+plot_dt[, label_f := paste0(label, fifelse(evaluated_on != "full validation", "*", ""))]
+
+metric_plot <- function(dt, metric, title, note) {
+  d <- copy(dt)[, value := get(metric)]
+  d[, label_f := factor(label_f, levels = d[order(value)]$label_f)]
+  ggplot(d, aes(value, label_f, colour = evaluated_on)) +
+    geom_segment(aes(x = min(value) - 0.5 * diff(range(value)), xend = value, yend = label_f), linewidth = 0.6) +
+    geom_point(size = 3.5) +
+    geom_text(aes(label = sprintf("%.4f", value)), hjust = -0.35, size = 3.3, show.legend = FALSE) +
+    scale_x_continuous(expand = expansion(mult = c(0.05, 0.2))) +
+    labs(title = title, subtitle = note, x = NULL, y = NULL, colour = NULL,
+         caption = "* KNN scored on a 5,000-row validation subsample; others on full validation. Axis does not start at zero.") +
+    theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+}
+```
+
+```{r fig-auc}
+#| fig-width: 8
+#| fig-height: 4
+p_auc <- metric_plot(plot_dt, "auc", "Tuned models: validation AUC", "Higher is better")
+ggsave(file.path(FIGURE_DIR, "model_auc_comparison.png"), p_auc, width = 8, height = 4, dpi = 200)
+p_auc
+```
+
+```{r fig-brier}
+#| fig-width: 8
+#| fig-height: 4
+p_brier <- metric_plot(plot_dt, "brier", "Tuned models: validation Brier score", "Lower is better")
+ggsave(file.path(FIGURE_DIR, "model_brier_comparison.png"), p_brier, width = 8, height = 4, dpi = 200)
+p_brier
+```
+
+```{r fig-prauc}
+#| fig-width: 8
+#| fig-height: 4
+p_pr <- metric_plot(plot_dt, "pr_auc", "Tuned models: validation PR-AUC", "Higher is better")
+ggsave(file.path(FIGURE_DIR, "model_pr_auc_comparison.png"), p_pr, width = 8, height = 4, dpi = 200)
+p_pr
+```
+
+```{r fig-gain}
+#| fig-width: 8
+#| fig-height: 4
+gain_dt <- copy(comparison)
+gain_dt[, label_f := paste0(label, fifelse(evaluated_on != "full validation", "*", ""))]
+gain_dt[, label_f := factor(label_f, levels = gain_dt[order(auc_delta)]$label_f)]
+p_gain <- ggplot(gain_dt, aes(auc_delta, label_f, fill = evaluated_on)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = sprintf("%+.5f", auc_delta)), hjust = -0.1, size = 3.3) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.25))) +
+  labs(title = "Tuning gain: tuned minus baseline validation AUC", x = "Delta AUC", y = NULL, fill = NULL,
+       caption = "* KNN delta is on a subsample; confirm the baseline used the same rows before quoting it.") +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+ggsave(file.path(FIGURE_DIR, "model_tuning_gain.png"), p_gain, width = 8, height = 4, dpi = 200)
+p_gain
+```
+
+## Comparative figures: ROC, Precision-Recall, confusion matrices, feature importance
+
+These four are what Phase 2's own checklist asks for explicitly ("Comparative visualizations (ROC, Confusion Matrix, Feature Importance, Precision-Recall, etc.)") -- the dot plots above cover the same information numerically, these cover it the way the brief asks for.
+
+```{r roc-pr-data}
+curve_data <- rbindlist(lapply(seq_len(nrow(models)), function(i) {
+  p <- preds[[models$tuned_col[i]]]
+  keep <- which(!is.na(p))
+  lbl <- plot_dt[model_id == models$model_id[i], label_f]
+  roc_pts <- roc_curve_points(y[keep], p[keep])[, `:=`(curve = "roc", label = lbl)]
+  pr_pts  <- pr_curve_points(y[keep], p[keep])[, `:=`(curve = "pr", label = lbl)]
+  rbindlist(list(roc_pts, pr_pts), fill = TRUE)
+}))
+fwrite(curve_data, file.path(TABLE_DIR, "model_roc_pr_curve_points.csv"))
+```
+
+```{r fig-roc}
+#| fig-width: 7
+#| fig-height: 6
+p_roc <- ggplot(curve_data[curve == "roc"], aes(fpr, tpr, colour = label)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_line(linewidth = 0.8) +
+  labs(title = "ROC curves — tuned models (validation)",
+       subtitle = "Dashed line = random-chance classifier",
+       x = "False Positive Rate", y = "True Positive Rate", colour = NULL,
+       caption = "KNN's curve uses its 5,000-row subsample; the others use full validation.") +
+  coord_equal() + theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+ggsave(file.path(FIGURE_DIR, "model_roc_curves.png"), p_roc, width = 7, height = 6, dpi = 200)
+p_roc
+```
+
+```{r fig-pr}
+#| fig-width: 7
+#| fig-height: 6
+prevalence <- mean(y)
+p_pr_curve <- ggplot(curve_data[curve == "pr"], aes(recall, precision, colour = label)) +
+  geom_hline(yintercept = prevalence, linetype = "dashed", colour = "grey60") +
+  geom_line(linewidth = 0.8) +
+  labs(title = "Precision-Recall curves — tuned models (validation)",
+       subtitle = paste0("Dashed line = no-skill baseline (prevalence = ", round(prevalence, 3), ")"),
+       x = "Recall", y = "Precision", colour = NULL,
+       caption = "KNN's curve uses its 5,000-row subsample; the others use full validation.") +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+ggsave(file.path(FIGURE_DIR, "model_pr_curves.png"), p_pr_curve, width = 7, height = 6, dpi = 200)
+p_pr_curve
+```
+
+```{r fig-confusion}
+#| fig-width: 8
+#| fig-height: 6
+confusion_data <- rbindlist(lapply(selection[selected == TRUE, model_id], function(id) {
+  p <- preds[[models[model_id == id, tuned_col]]]
+  keep <- which(!is.na(p))
+  pred <- as.integer(p[keep] >= 0.5)
+  tab <- as.data.table(table(Actual = y[keep], Predicted = pred))
+  tab[, model_id := id]
+  tab
+}))
+confusion_data <- merge(confusion_data, models[, .(model_id, label)], by = "model_id")
+confusion_data[, Actual := factor(Actual, levels = c(0, 1), labels = c("Retained", "Returned"))]
+confusion_data[, Predicted := factor(Predicted, levels = c(0, 1), labels = c("Retained", "Returned"))]
+fwrite(confusion_data, file.path(TABLE_DIR, "model_confusion_matrix_counts.csv"))
+
+p_confusion <- ggplot(confusion_data, aes(Predicted, Actual, fill = N)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = N), colour = "white", size = 4.2, fontface = "bold") +
+  scale_fill_viridis_c(guide = "none") +
+  facet_wrap(~ label) +
+  labs(title = "Confusion matrices at threshold 0.5 (selected models, full validation)",
+       subtitle = "Threshold 0.5 is a reference point only -- Phase 3's CRC policy threshold is value-weighted and category-aware, not 0.5",
+       x = "Predicted", y = "Actual") +
+  theme_minimal(base_size = 11)
+ggsave(file.path(FIGURE_DIR, "model_confusion_matrices.png"), p_confusion, width = 8, height = 6, dpi = 200)
+p_confusion
+```
+
+### Feature importance
+
+**Limitation, stated plainly:** Random Forest has no extractable feature importance here. Stage 6's and Stage 7's `ranger()` calls never set `importance = "permutation"` (or `"impurity"`) at fit time, and `ranger` does not compute it retroactively from a fitted object -- recovering it would mean refitting the model, which needs the raw training pool this stage does not load. KNN fundamentally has no global feature-importance concept (it is a lazy, instance-based learner with no fitted weights). Both are therefore skipped below rather than faked.
+
+```{r fig-xgboost-importance}
+#| fig-width: 7
+#| fig-height: 6
+xgb_importance <- tryCatch({
+  xgb_fit <- readRDS(models[model_id == "xgboost", model_path])
+  imp <- as.data.table(xgboost::xgb.importance(model = xgb_fit))
+  imp[order(-Gain)][seq_len(min(15, .N))]
+}, error = function(e) { cat("WARN: could not extract XGBoost importance:", conditionMessage(e), "\n"); NULL })
+
+if (!is.null(xgb_importance)) {
+  fwrite(xgb_importance, file.path(TABLE_DIR, "model_xgboost_importance.csv"))
+  p_xgb_imp <- ggplot(xgb_importance, aes(x = reorder(Feature, Gain), y = Gain)) +
+    geom_col(fill = "#4C72B0") + coord_flip() +
+    labs(title = "XGBoost feature importance (Gain)", x = NULL, y = "Gain") +
+    theme_minimal(base_size = 11)
+  ggsave(file.path(FIGURE_DIR, "model_xgboost_importance.png"), p_xgb_imp, width = 7, height = 6, dpi = 200)
+  p_xgb_imp
+}
+```
+
+```{r fig-elasticnet-importance}
+#| fig-width: 7
+#| fig-height: 6
+elastic_importance <- tryCatch({
+  en_fit <- readRDS(models[model_id == "elastic_net_logistic", model_path])
+  coefs <- as.matrix(coef(en_fit$model, s = en_fit$lambda))
+  dt <- data.table(feature = rownames(coefs), coefficient = coefs[, 1])[feature != "(Intercept)"]
+  dt[order(-abs(coefficient))][seq_len(min(15, .N))]
+}, error = function(e) { cat("WARN: could not extract Elastic-Net coefficients:", conditionMessage(e), "\n"); NULL })
+
+if (!is.null(elastic_importance)) {
+  fwrite(elastic_importance, file.path(TABLE_DIR, "model_elastic_net_importance.csv"))
+  p_en_imp <- ggplot(elastic_importance, aes(x = reorder(feature, coefficient), y = coefficient, fill = coefficient > 0)) +
+    geom_col() + coord_flip() +
+    scale_fill_manual(values = c(`TRUE` = "#C44E52", `FALSE` = "#4C72B0"), guide = "none") +
+    labs(title = "Elastic-Net coefficient ranking (standardized predictors)",
+         subtitle = "Red = pushes toward 'returned', blue = pushes toward 'retained'", x = NULL, y = "Coefficient") +
+    theme_minimal(base_size = 11)
+  ggsave(file.path(FIGURE_DIR, "model_elastic_net_importance.png"), p_en_imp, width = 7, height = 6, dpi = 200)
+  p_en_imp
+}
+```
+
+## Tables
+
+```{r write-tables}
+fwrite(comparison,     file.path(TABLE_DIR, "model_comparison_baseline_vs_tuned.csv"))
+fwrite(selection,      file.path(TABLE_DIR, "model_final_selection.csv"))
+fwrite(rbindlist(list(copy(tuned_metrics)[, scope := "own evaluation rows"],
+                      copy(common_subset)[, `:=`(scope = "common 5,000-row KNN subsample",
+                                                 evaluated_on = "validation subsample")]),
+                 fill = TRUE),
+       file.path(TABLE_DIR, "model_performance_comparison.csv"))
+fwrite(tuning_summary, file.path(TABLE_DIR, "model_tuning_summary.csv"))
+fwrite(boot_tbl,       file.path(TABLE_DIR, "model_auc_paired_bootstrap.csv"))
+```
+
+## Model registry for Phase 3
+
+```{r registry}
+xgb_ubj <- file.path(MODEL_ZOO_TUNED_DIR, "xgboost_tuned.ubj")
+tryCatch(xgboost::xgb.save(readRDS(models[model_id == "xgboost", model_path]), xgb_ubj),
+         error = function(e) {
+           xgb_ubj <<- NA_character_
+           cat("WARN: could not write XGBoost .ubj copy:", conditionMessage(e), "\n")
+         })
+
+registry <- list(
+  created = Sys.time(),
+  selection_basis = paste0("Validation split only; margin ", SELECTION_MARGIN, " AUC vs best"),
+  validation_used_for_tuning = TRUE,
+  note = paste("Tuned probabilities are NOT independent of the validation split.",
+               "Calibrate / run CRC on crc_calibration, evaluate on iid_holdout, audit on future_test."),
+  best_model = best_id,
+  models = lapply(seq_len(nrow(selection)), function(i) {
+    id <- selection$model_id[i]
+    list(model_id = id, label = selection$label[i], selected = selection$selected[i],
+         reason = selection$reason[i], validation_auc = selection$auc[i],
+         validation_brier = selection$brier[i], evaluated_on = selection$evaluated_on[i],
+         hyperparameters = comparison[model_id == id, hyperparameters],
+         model_path = models[model_id == id, model_path],
+         xgb_ubj_path = if (id == "xgboost") xgb_ubj else NA_character_,
+         tuned_prob_column = models[model_id == id, tuned_col])
+  })
+)
+saveRDS(registry, file.path(MODEL_DIR, "r_final_model_registry.rds"))
+cat("Selected for Phase 3:", paste(selection[selected == TRUE, label], collapse = ", "), "\n")
+```
+
+## Stage 8 quality gate
+
+```{r quality-gate}
+cat("============================================================\nSTAGE 8 QUALITY GATE\n",
+    "============================================================\n\n", sep = "")
+GATE_PASS <- TRUE
+fail_check <- function(msg) { cat("FAIL:", msg, "\n"); GATE_PASS <<- FALSE }
+warn_check <- function(msg) cat("WARN:", msg, "\n")
+pass_check <- function(msg) cat("PASS:", msg, "\n")
+
+tables <- c("model_comparison_baseline_vs_tuned", "model_final_selection",
+            "model_performance_comparison", "model_tuning_summary")
+if (all(file.exists(file.path(TABLE_DIR, paste0(tables, ".csv"))))) pass_check("All 4 Stage 8 summary tables written.") else fail_check("A Stage 8 summary table is missing.")
+
+required_figs <- c("model_auc_comparison", "model_brier_comparison", "model_pr_auc_comparison",
+                    "model_tuning_gain", "model_roc_curves", "model_pr_curves", "model_confusion_matrices")
+if (all(file.exists(file.path(FIGURE_DIR, paste0(required_figs, ".png"))))) pass_check("All 7 required figures written (dot plots + ROC/PR/confusion matrix).") else fail_check("A required figure is missing.")
+
+optional_importance_figs <- c("model_xgboost_importance", "model_elastic_net_importance")
+present_importance <- file.exists(file.path(FIGURE_DIR, paste0(optional_importance_figs, ".png")))
+if (all(present_importance)) pass_check("Both feature-importance figures (XGBoost, Elastic-Net) written.") else warn_check("At least one feature-importance figure is missing -- check the WARN messages above for the extraction error.")
+
+if (nrow(comparison) == 4) pass_check("Comparison has all 4 models.") else fail_check("Comparison does not have 4 models.")
+chk <- merge(comparison[, .(model_id, tuned_auc)], stage7_comparison[, .(model_id, s7 = tuned_auc)], by = "model_id")
+if (all(abs(chk$tuned_auc - chk$s7) < 1e-6)) pass_check("Recomputed tuned AUCs match Stage 7's table.") else fail_check("Recomputed tuned AUC differs from tune_05_baseline_vs_tuned.csv; prediction file or row order is off.")
+if (abs(fast_auc(y, P[, 1]) - tuned_metrics[model_id == full_ids[1], auc]) < 1e-6) pass_check("Rank-based AUC agrees with auc_roc().") else warn_check("fast_auc() and auc_roc() disagree; bootstrap CIs may be slightly off.")
+
+if (sum(selection$selected) >= 2) pass_check(paste(sum(selection$selected), "models selected for Phase 3.")) else warn_check("Fewer than 2 models selected.")
+if (any(selection[selected == TRUE, evaluated_on] != "full validation")) fail_check("A subsample-evaluated model was selected.") else pass_check("Every selected model was scored on full validation.")
+if (all(file.exists(models[model_id %in% selection[selected == TRUE, model_id], model_path]))) pass_check("Selected model files exist.") else fail_check("A selected model file is missing.")
+if (file.exists(file.path(MODEL_DIR, "r_final_model_registry.rds"))) pass_check("Model registry saved.") else fail_check("Registry not saved.")
+
+if (!is.null(knn_baseline_check) && !isTRUE(knn_baseline_check$same_rows)) warn_check("Baseline KNN was not scored on the same rows as tuned KNN; its auc_delta is not like-for-like.")
+if (is.null(knn_baseline_check)) warn_check("KNN baseline rows unverified; do not quote the KNN tuning gain as exact.")
+if (any(boot_tbl$gap_ci_low > 0)) warn_check("Some models have an AUC gap to the best whose 95% CI excludes 0: small but statistically detectable.")
+
+if (!GATE_PASS) stop("Stage 8 quality gate failed -- see FAIL messages above.")
+cat("\nAll required checks passed.\n")
+```
+
+## Handoff to Phase 3
+
+The selected models and their tuned hyperparameters are recorded in `models/r_final_model_registry.rds`. Their tuned probabilities are not independent of `validation`, so Phase 3 calibrates on `crc_calibration`, evaluates on `iid_holdout`, and audits drift on `future_test`.
+
+## Limitations
+
+- All hyperparameters, including XGBoost's early-stopping round count, were chosen on `validation`, so tuned validation metrics are mildly optimistic.
+- KNN was tuned and scored on a 5,000-row validation subsample with an 8,000-row training subsample, so its metrics are not directly comparable to the other models'.
+- Several optima sat on grid boundaries (KNN k, XGBoost max_depth and eta, Random Forest mtry and min.node.size), so wider grids might give small further gains.
+- The selection margin (`r SELECTION_MARGIN` AUC) is a judgment call; gaps inside it may still be statistically detectable (see the bootstrap table).
+- Random Forest and KNN have no feature-importance figure (see the note above the importance plots) -- this is a genuine gap in what Stage 6/7 saved, not an oversight here.
+- The confusion matrices use threshold 0.5 purely as a conventional reference point; it is not the project's actual decision rule (that is Phase 1's value-weighted, category-aware CRC threshold).
+
+```{r session-info}
+sessionInfo()
+```

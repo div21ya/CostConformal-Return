@@ -1,0 +1,3 @@
+isReturned,events_with_price,mean_price,median_price,p95_price,p99_price,label
+1,494049,26.9744880366118,21.74,64.72,108.41,Returned
+0,400494,21.7598184741844,17.56,53.8934999999998,92.99,Retained

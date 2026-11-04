@@ -1,0 +1,1828 @@
+---
+title: "CostConformal-Return — Stage 3: Calibration and Conformal Risk Control"
+subtitle: "Category-Aware and Future-Period Drift-Audited Conformal Risk Control for Value-Sensitive E-Commerce Returns"
+author: "Simran Kumari (24BDS1031)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    df-print: kable
+    theme: cosmo
+execute:
+  warning: false
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath("."))
+```
+
+# Purpose of this stage
+
+This notebook is Stage 3 of the CostConformal-Return pipeline. Missing-value imputation, categorical encoding, and normalization are **no longer fit here** — they were moved to their own notebook, Stage 1.5 (`01b_preprocessing.qmd`), so preprocessing is auditable as its own pipeline step rather than hidden inside modeling code. This notebook picks up from there and finishes the work the project report flags as incomplete: the calibration comparison, the CRC target-results table, the category-aware extension, the subgroup/intervention-burden audit, and the future-period drift audit, in the priority order from Section 11 of the report:
+
+1.  Complete the calibration/CRC run
+2.  Category-aware CRC
+3.  Subgroup / intervention-burden audit
+4.  Future-period drift audit
+
+It reads the preprocessed splits and the fitted preprocessor written by Stage 1.5, and writes model objects to `models/`, tables to `outputs/tables/`, and figures to `outputs/figures/`.
+
+# Before you render this document
+
+1.  Save this file as `03_calibration_crc_visualizations.qmd` in the project root.
+2.  Confirm Stage 1, Stage 1.5, and Stage 2's checklists are all green — in particular, `data/processed/*_prep.csv.gz` (the five files Stage 1.5 writes) and `models/r_preprocessor.rds` must already exist.
+3.  Render with `Ctrl/Cmd+Shift+K`, or run chunk-by-chunk — this stage fits a model and does several full-data passes, so the first render will take noticeably longer than Stages 1–2.
+
+# Setup and data loading
+
+```{r source-setup}
+source(file.path("R", "00_setup.R"))
+```
+
+```{r load-preprocessed-splits}
+preprocessed_files <- c(
+  model_train = file.path(PROCESSED_DIR, "model_train_prep.csv.gz"),
+  validation = file.path(PROCESSED_DIR, "validation_prep.csv.gz"),
+  crc_calibration = file.path(PROCESSED_DIR, "crc_calibration_prep.csv.gz"),
+  iid_holdout = file.path(PROCESSED_DIR, "iid_holdout_prep.csv.gz"),
+  future_test = file.path(PROCESSED_DIR, "official_future_test_prep.csv.gz")
+)
+preprocessor_file <- file.path(MODEL_DIR, "r_preprocessor.rds")
+assert_files_exist(c(preprocessed_files, preprocessor = preprocessor_file))
+
+preprocessor <- readRDS(preprocessor_file)
+
+model_train_prep <- fread(preprocessed_files[["model_train"]])
+validation_prep <- fread(preprocessed_files[["validation"]])
+crc_calibration_prep <- fread(preprocessed_files[["crc_calibration"]])
+iid_holdout_prep <- fread(preprocessed_files[["iid_holdout"]])
+future_test_prep <- fread(preprocessed_files[["future_test"]])
+
+cat(
+  "model_train:", nrow(model_train_prep),
+  "| validation:", nrow(validation_prep),
+  "| crc_calibration:", nrow(crc_calibration_prep),
+  "| iid_holdout:", nrow(iid_holdout_prep),
+  "| future_test:", nrow(future_test_prep), "\n"
+)
+```
+
+`fwrite()`/`fread()` round-tripping doesn't preserve R's `factor` type — the categorical columns come back as plain character vectors. Their *values* are already correctly encoded (rare/unseen levels collapsed to `"OTHER"` by Stage 1.5), but we still restore them to factors with the exact training-time level set here, so `glm()`'s reference-level contrasts are built identically across every split.
+
+```{r restore-factor-types}
+NUMERIC_FEATURES <- names(preprocessor$medians)
+CATEGORICAL_FEATURES <- names(preprocessor$allowed_levels)
+
+restore_factor_types <- function(dt, preproc) {
+  dt <- copy(dt)
+  for (col in names(preproc$allowed_levels)) {
+    if (col %in% names(dt)) {
+      levs <- union(preproc$allowed_levels[[col]], "OTHER")
+      set(dt, j = col, value = factor(dt[[col]], levels = levs))
+    }
+  }
+  dt
+}
+
+model_train_prep <- restore_factor_types(model_train_prep, preprocessor)
+validation_prep <- restore_factor_types(validation_prep, preprocessor)
+crc_calibration_prep <- restore_factor_types(crc_calibration_prep, preprocessor)
+iid_holdout_prep <- restore_factor_types(iid_holdout_prep, preprocessor)
+future_test_prep <- restore_factor_types(future_test_prep, preprocessor)
+```
+
+`brandDesc` is excluded from the baseline logistic regression despite being in the feature dictionary: it has thousands of distinct values, and a one-hot-encoded high-cardinality factor is a poor fit for a linear baseline (it either fails to fit cleanly or overfits on rare brands). It's kept in the preprocessed data as an audit column and is the natural first upgrade when the report's "optional stronger baseline" (LightGBM/XGBoost, which handles high-cardinality categoricals natively) is implemented — the CRC/policy code downstream only consumes a calibrated probability column, so swapping the model is a drop-in change.
+
+# Predictor-completeness gate (fail fast, before fitting anything)
+
+Stage 1.5 is supposed to guarantee zero `NA` in every predictor this model uses. This gate checks that guarantee directly, on the actual objects this notebook is about to fit and predict on, rather than trusting that Stage 1.5's own gate ran correctly. If this fires, the fix belongs in Stage 1.5 (`01b_preprocessing.qmd`), not here — re-run that notebook and then re-run this one from the top; do not patch around a specific NA count downstream (e.g. by dropping the affected rows), since that would silently change which rows the model is fit and evaluated on.
+
+```{r predictor-completeness-gate}
+BINARY_FEATURES <- c("isMale", "premier")
+
+# Missing/unseen categorical values are already represented
+# by the "OTHER" factor level in Stage 1.5.
+# Do NOT add customer_missing/product_missing to the model.
+MISSINGNESS_FLAGS <- character(0)
+
+MODEL_PREDICTORS <- c(
+  setdiff(NUMERIC_FEATURES, "type_median_price"),
+  CATEGORICAL_FEATURES,
+  "isMale",
+  "premier"
+)
+
+all_prep_splits <- list(
+  model_train = model_train_prep,
+  validation = validation_prep,
+  crc_calibration = crc_calibration_prep,
+  iid_holdout = iid_holdout_prep,
+  future_test = future_test_prep
+)
+
+predictor_na_check <- rbindlist(
+  lapply(names(all_prep_splits), function(nm) {
+    
+    dt <- all_prep_splits[[nm]]
+    
+    present <- intersect(
+      MODEL_PREDICTORS,
+      names(dt)
+    )
+    
+    missing_cols <- setdiff(
+      MODEL_PREDICTORS,
+      names(dt)
+    )
+    
+    if (length(missing_cols) > 0) {
+      stop(paste0(
+        nm,
+        " is missing predictor column(s) required by the Stage 3 model formula: ",
+        paste(missing_cols, collapse = ", "),
+        ". Check that Stage 1.5 was re-run with the current predictor contract."
+      ))
+    }
+    
+    data.table(
+      split = nm,
+      feature = present,
+      n_na = sapply(
+        present,
+        function(col) sum(is.na(dt[[col]]))
+      )
+    )
+  })
+)
+
+bad_predictors <- predictor_na_check[n_na > 0]
+
+if (nrow(bad_predictors) > 0) {
+  
+  print(bad_predictors)
+  
+  stop(
+    "Stage 3 stopped: one or more model predictors still contain NA after Stage 1.5. ",
+    "Re-run 01b_preprocessing.qmd before re-running this notebook."
+  )
+}
+
+cat(
+  "PASS: all",
+  length(MODEL_PREDICTORS),
+  "model predictors are NA-free in every split.\n"
+)
+
+```
+
+# Baseline model: Logistic Regression on a stratified sample
+
+Fit on a reproducible sample of up to 250,000 `model_train` events, stratified by `isReturned` so the \~55% return rate is preserved. This keeps `glm()` fast without sacrificing much statistical power at this sample size.
+
+```{r fit-baseline}
+MAX_TRAIN_N <- 250000
+
+set.seed(20260731)
+
+stratified_sample <- function(dt, max_n) {
+  if (nrow(dt) <= max_n) return(copy(dt))
+  
+  frac <- max_n / nrow(dt)
+  
+  dt[
+    ,
+    .SD[
+      sample(
+        .N,
+        size = max(1, round(.N * frac))
+      )
+    ],
+    by = isReturned
+  ]
+}
+
+train_sample <- stratified_sample(
+  model_train_prep,
+  MAX_TRAIN_N
+)
+
+cat(
+  "Baseline model fit on",
+  nrow(train_sample),
+  "sampled rows.\n"
+)
+
+# Stage 1.5 already represents missing/unseen
+# categorical values using the explicit "OTHER" category.
+#
+# Missingness flags are therefore not included separately.
+BINARY_FEATURES <- c("isMale", "premier")
+MISSINGNESS_FLAGS <- character(0)
+
+# type_median_price is derived directly from productType.
+# Including both creates an exact linear dependency in
+# the current design matrix, so exclude type_median_price
+# from this GLM while retaining it in the preprocessed data.
+MODEL_PREDICTORS <- c(
+  setdiff(NUMERIC_FEATURES, "type_median_price"),
+  CATEGORICAL_FEATURES,
+  BINARY_FEATURES
+)
+
+model_formula <- as.formula(
+  paste(
+    "isReturned ~",
+    paste(MODEL_PREDICTORS, collapse = " + ")
+  )
+)
+
+cat("Baseline GLM formula:\n")
+print(model_formula)
+
+train_sample <- copy(train_sample)
+
+baseline_model <- glm(
+  formula = model_formula,
+  data = train_sample,
+  family = binomial()
+)
+
+cat("\nBaseline GLM fitted.\n")
+cat(
+  "Number of coefficients:",
+  length(coef(baseline_model)),
+  "\n"
+)
+
+summary(baseline_model)
+
+# ------------------------------------------------------------
+# Design-matrix rank diagnostic
+# ------------------------------------------------------------
+
+X <- model.matrix(
+  model_formula,
+  data = train_sample
+)
+
+cat("\nDesign matrix dimensions:\n")
+cat("Rows:", nrow(X), "\n")
+cat("Columns:", ncol(X), "\n")
+
+cat("\nColumns involving OTHER:\n")
+print(grep(
+  "OTHER",
+  colnames(X),
+  value = TRUE
+))
+
+cat("\nRank diagnostic:\n")
+cat("Matrix rank:", qr(X)$rank, "\n")
+cat("Number of columns:", ncol(X), "\n")
+
+if (qr(X)$rank < ncol(X)) {
+  
+  cat("\nWARNING: design matrix is still rank deficient.\n")
+  
+  cat("\nAlias diagnostic:\n")
+  print(alias(baseline_model))
+  
+} else {
+  
+  cat("\nPASS: design matrix is full rank.\n")
+}
+```
+
+```{r}
+X <- model.matrix(
+  model_formula,
+  data = train_sample
+)
+
+cat("\nDesign matrix dimensions:\n")
+cat("Rows:", nrow(X), "\n")
+cat("Columns:", ncol(X), "\n")
+
+cat("\nColumns involving OTHER:\n")
+print(grep(
+  "OTHER",
+  colnames(X),
+  value = TRUE
+))
+
+cat("\nRank diagnostic:\n")
+cat("Matrix rank:", qr(X)$rank, "\n")
+cat("Number of columns:", ncol(X), "\n")
+
+if (qr(X)$rank < ncol(X)) {
+  cat("\nWARNING: design matrix is still rank deficient.\n")
+  cat("\nAlias diagnostic:\n")
+  print(alias(baseline_model))
+} else {
+  cat("\nPASS: design matrix is full rank.\n")
+}
+```
+
+## Model-validity gate: reject a rank-deficient fit before saving it
+
+A `glm()` with an aliased (rank-deficient) design matrix reports `NA` for the affected coefficient(s) rather than erroring — so an invalid model can look like a successful fit and get saved, scored, and only fail loudly several steps later when `isoreg()` chokes on the resulting `NA` probabilities. This gate catches that here, at the source, with the diagnostics needed to fix it (`alias()` identifies exactly which terms are structurally redundant, e.g. a missingness-flag perfectly determined by another predictor once that predictor's own missing values are consistently coded).
+
+```{r model-validity-gate}
+coef_values <- coef(baseline_model)
+bad_terms <- names(coef_values)[!is.finite(coef_values)]
+
+if (length(bad_terms) > 0) {
+  cat(
+    "Non-finite coefficient(s) found for:",
+    paste(bad_terms, collapse = ", "),
+    "\n\n"
+  )
+  
+  cat(
+    "alias() diagnostic (identifies which terms are structurally redundant):\n"
+  )
+  
+  print(alias(baseline_model))
+  
+  stop(
+    "Stage 3 stopped: baseline GLM has non-finite (aliased) coefficient(s): ",
+    paste(bad_terms, collapse = ", "),
+    ". Inspect the alias() output above and the model_formula predictor set ",
+    "before proceeding -- do not silently drop the affected rows or terms."
+  )
+}
+
+cat(
+  "PASS: all",
+  length(coef_values),
+  "baseline GLM coefficients are finite.\n"
+)
+
+saveRDS(
+  baseline_model,
+  file.path(MODEL_DIR, "r_logistic_baseline.rds")
+)
+```
+
+```{r score-validation}
+score_dt <- function(dt, model) {
+  dt <- copy(dt)
+  dt[, raw_prob := predict(model, newdata = dt, type = "response")]
+  dt
+}
+
+validation_scored <- score_dt(validation_prep, baseline_model)
+
+# Prediction-validity gate: with a coefficient-finite model and NA-free
+# predictors (both already checked above), raw_prob should be finite for
+# every row. Checking this explicitly, right here, turns any regression into
+# an immediate, specific stop() instead of a confusing downstream isoreg()
+# crash ("missing values not allowed").
+if (any(!is.finite(validation_scored$raw_prob))) {
+  n_bad <- sum(!is.finite(validation_scored$raw_prob))
+  stop(paste0(
+    "Stage 3 stopped: baseline model produced ", n_bad,
+    " non-finite (NA/NaN/Inf) validation probabilities out of ", nrow(validation_scored),
+    " rows. Calibration cannot proceed. This should not happen if the ",
+    "predictor-completeness and model-validity gates above both passed -- ",
+    "re-check those before investigating further."
+  ))
+}
+cat("PASS: all", nrow(validation_scored), "validation predictions are finite.\n")
+
+val_auc <- auc_roc(validation_scored$isReturned, validation_scored$raw_prob)
+val_prauc <- pr_auc(validation_scored$isReturned, validation_scored$raw_prob)
+val_brier_raw <- brier_score(validation_scored$isReturned, validation_scored$raw_prob)
+val_logloss_raw <- log_loss(validation_scored$isReturned, validation_scored$raw_prob)
+
+cat(
+  "Validation (raw, uncalibrated) — AUC:", round(val_auc, 4),
+  "| PR-AUC:", round(val_prauc, 4),
+  "| Brier:", round(val_brier_raw, 4),
+  "| log-loss:", round(val_logloss_raw, 4), "\n"
+)
+```
+
+# Calibration: raw vs. Platt scaling vs. isotonic regression
+
+```{r fit-calibrators}
+# Platt scaling: logistic regression of the true label on the logit of the
+# raw predicted probability.
+platt_model <- glm(
+  isReturned ~ qlogis(pmin(pmax(raw_prob, 1e-6), 1 - 1e-6)),
+  data = validation_scored,
+  family = binomial()
+)
+platt_predict <- function(raw_prob) {
+  eps <- 1e-6
+  predict(
+    platt_model,
+    newdata = data.table(raw_prob = pmin(pmax(raw_prob, eps), 1 - eps)),
+    type = "response"
+  )
+}
+
+# Isotonic regression: monotone step-function fit of true label on raw
+# predicted probability, extended as a step function for prediction on new data.
+iso_fit <- isoreg(x = validation_scored$raw_prob, y = validation_scored$isReturned)
+iso_step <- as.stepfun(iso_fit)
+isotonic_predict <- function(raw_prob) {
+  pmin(pmax(iso_step(raw_prob), 0), 1)
+}
+
+calibration_candidates <- list(
+  raw = function(p) p,
+  platt = platt_predict,
+  isotonic = isotonic_predict
+)
+
+calibration_comparison <- rbindlist(lapply(names(calibration_candidates), function(nm) {
+  cal_prob <- calibration_candidates[[nm]](validation_scored$raw_prob)
+  data.table(
+    method = nm,
+    brier = brier_score(validation_scored$isReturned, cal_prob),
+    log_loss = log_loss(validation_scored$isReturned, cal_prob)
+  )
+}))
+setorder(calibration_comparison, brier)
+
+fwrite(calibration_comparison, file.path(TABLE_DIR, "model_01_calibration_comparison.csv"))
+calibration_comparison
+```
+
+```{r select-calibrator}
+best_method <- calibration_comparison$method[1]
+cat("Selected calibration method (lowest validation Brier score):", best_method, "\n")
+# Note for the report: this selects whichever method minimizes Brier score
+# on the validation split -- a project-specific selection rule, not a
+# universal claim that this method is "objectively best." The validation
+# split is used here to both choose and evaluate the calibrator, so
+# `calibration_comparison` should be described as validation-based
+# calibrator selection/comparison, not as an independent, untouched
+# generalization estimate.
+
+calibrate_prob <- calibration_candidates[[best_method]]
+saveRDS(
+  list(method = best_method, platt_model = platt_model, iso_step = iso_step),
+  file.path(MODEL_DIR, "r_calibrator.rds")
+)
+```
+
+## Calibration curve (Figure 07)
+
+```{r calibration-curve}
+validation_scored[, calibrated_prob := calibrate_prob(raw_prob)]
+
+# unique() guards against duplicate breakpoints, which cut() otherwise
+# rejects with "'breaks' are not unique" -- a real risk here since isotonic
+# regression's calibrated_prob is a step function with many repeated values,
+# so several of the 11 quantile cut points can coincide.
+cal_breaks <- unique(quantile(
+  validation_scored$calibrated_prob, probs = seq(0, 1, 0.1),
+  names = FALSE, na.rm = TRUE
+))
+
+if (length(cal_breaks) < 2) {
+  stop("Calibration curve cannot be constructed: calibrated_prob has insufficient variation to form even two bins.")
+}
+
+validation_scored[, cal_decile := cut(
+  calibrated_prob,
+  breaks = cal_breaks,
+  include.lowest = TRUE,
+  labels = FALSE
+)]
+
+cal_curve <- validation_scored[, .(
+  n = .N,
+  mean_predicted = mean(calibrated_prob),
+  empirical_rate = mean(isReturned)
+), by = cal_decile][order(cal_decile)]
+
+fwrite(cal_curve, file.path(TABLE_DIR, "model_02_calibration_curve.csv"))
+
+p_calib <- ggplot(cal_curve, aes(x = mean_predicted, y = empirical_rate)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(size = 2.5, color = "#4C72B0") +
+  geom_line(color = "#4C72B0") +
+  scale_x_continuous(labels = percent, limits = c(0, 1)) +
+  scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  labs(
+    title = paste0("Calibration curve (", best_method, " calibration, validation split)"),
+    subtitle = "Dashed line = perfect calibration",
+    x = "Mean predicted probability (decile)", y = "Empirical return rate"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_calib
+save_plot(p_calib, "07_calibration_curve.png")
+```
+
+# Scoring the remaining splits with the calibrated model
+
+```{r score-remaining-splits}
+crc_calibration_scored <- score_dt(crc_calibration_prep, baseline_model)
+crc_calibration_scored[, calibrated_prob := calibrate_prob(raw_prob)]
+
+iid_holdout_scored <- score_dt(iid_holdout_prep, baseline_model)
+iid_holdout_scored[, calibrated_prob := calibrate_prob(raw_prob)]
+
+future_test_scored <- score_dt(future_test_prep, baseline_model)
+future_test_scored[, calibrated_prob := calibrate_prob(raw_prob)]
+```
+
+# Conformal Risk Control
+
+Bounded, monotone policy loss for threshold $\tau$: $$L_i(\tau) = y_i \cdot v_i \cdot \mathbb{1}[\hat p_i < \tau]$$ This is non-decreasing in $\tau$ (raising the intervention bar means fewer items get intervened on, so more returned items' value is missed). CRC selects the **largest** $\tau$ — the least-intervention policy — for which the finite-sample-corrected empirical risk still stays under the target $\alpha$: $$\frac{n}{n+1}\widehat R(\tau) + \frac{1}{n+1} < \alpha$$
+
+```{r crc-function}
+crc_select_threshold <- function(y, v, phat, alpha, n_grid = 200) {
+  ok <- !is.na(y) & !is.na(v) & !is.na(phat)
+  y <- y[ok]; v <- v[ok]; phat <- phat[ok]
+  n <- length(y)
+  if (n == 0) stop("No valid (y, v, phat) rows to select a threshold from.")
+
+  taus <- sort(unique(c(0, quantile(phat, probs = seq(0, 1, length.out = n_grid), names = FALSE), 1)))
+  risks <- sapply(taus, function(tau) mean(y * v * (phat < tau)))
+  corrected <- (n / (n + 1)) * risks + 1 / (n + 1)
+
+  feasible_idx <- which(corrected < alpha)
+  if (length(feasible_idx) == 0) {
+    warning("No threshold satisfies alpha = ", alpha, "; falling back to tau = 0 (maximal intervention).")
+    return(list(tau = 0, risk = risks[1], corrected_risk = corrected[1], n = n))
+  }
+
+  best_idx <- feasible_idx[which.max(taus[feasible_idx])]
+  list(tau = taus[best_idx], risk = risks[best_idx], corrected_risk = corrected[best_idx], n = n)
+}
+
+evaluate_threshold <- function(y, v, phat, tau) {
+  ok <- !is.na(y) & !is.na(v) & !is.na(phat)
+  y <- y[ok]; v <- v[ok]; phat <- phat[ok]
+  list(
+    risk = mean(y * v * (phat < tau)),
+    intervention_rate = mean(phat >= tau),
+    n = length(y)
+  )
+}
+```
+
+## CRC target-results table (the table Stage 3 previously stopped short of)
+
+```{r crc-target-results}
+ALPHA_GRID <- c(0.01, 0.025, 0.05, 0.075, 0.10)
+
+crc_target_results <- rbindlist(lapply(ALPHA_GRID, function(alpha) {
+  sel <- crc_select_threshold(
+    crc_calibration_scored$isReturned,
+    crc_calibration_scored$value_exposure,
+    crc_calibration_scored$calibrated_prob,
+    alpha
+  )
+  holdout_eval <- evaluate_threshold(
+    iid_holdout_scored$isReturned, iid_holdout_scored$value_exposure,
+    iid_holdout_scored$calibrated_prob, sel$tau
+  )
+  future_eval <- evaluate_threshold(
+    future_test_scored$isReturned, future_test_scored$value_exposure,
+    future_test_scored$calibrated_prob, sel$tau
+  )
+  calib_eval <- evaluate_threshold(
+    crc_calibration_scored$isReturned, crc_calibration_scored$value_exposure,
+    crc_calibration_scored$calibrated_prob, sel$tau
+  )
+
+  data.table(
+    alpha = alpha,
+    tau = sel$tau,
+    calibration_risk = calib_eval$risk,
+    calibration_corrected_risk = sel$corrected_risk,
+    calibration_intervention_rate = calib_eval$intervention_rate,
+    iid_holdout_risk = holdout_eval$risk,
+    iid_holdout_intervention_rate = holdout_eval$intervention_rate,
+    future_test_risk = future_eval$risk,
+    future_test_intervention_rate = future_eval$intervention_rate,
+    risk_target_met_on_holdout = holdout_eval$risk < alpha,
+    risk_target_met_on_future_test = future_eval$risk < alpha
+  )
+}))
+
+fwrite(crc_target_results, file.path(TABLE_DIR, "model_04_crc_target_results.csv"))
+crc_target_results
+```
+
+::: callout-note
+**Scope of the guarantee.** The split-CRC guarantee formally applies to the exchangeable calibration/IID-holdout setting — the `risk_target_met_on_holdout` column is the formal check. `risk_target_met_on_future_test` is reported as a **robustness check**, not a restatement of the formal guarantee: the released data provides no timestamps to certify exchangeability across the Sep–Oct → Oct–Nov boundary, so a violation there motivates the drift audit below rather than invalidating the method.
+:::
+
+## Threshold / exposure figure (Figure 06)
+
+```{r threshold-exposure-figure}
+tau_grid <- quantile(crc_calibration_scored$calibrated_prob, probs = seq(0, 1, 0.02), names = FALSE)
+
+threshold_curve <- rbindlist(lapply(tau_grid, function(tau) {
+  ev <- evaluate_threshold(
+    crc_calibration_scored$isReturned, crc_calibration_scored$value_exposure,
+    crc_calibration_scored$calibrated_prob, tau
+  )
+  data.table(tau = tau, risk = ev$risk, intervention_rate = ev$intervention_rate)
+}))
+
+threshold_long <- melt(
+  threshold_curve, id.vars = "tau",
+  measure.vars = c("risk", "intervention_rate"),
+  variable.name = "metric", value.name = "value"
+)
+threshold_long[, metric := fifelse(metric == "risk", "Calibration risk", "Intervention rate")]
+
+p_threshold <- ggplot(threshold_long, aes(x = tau, y = value, color = metric)) +
+  geom_line(linewidth = 0.9) +
+  geom_hline(
+    data = data.table(alpha = ALPHA_GRID),
+    aes(yintercept = alpha), inherit.aes = FALSE,
+    linetype = "dotted", color = "grey60"
+  ) +
+  facet_wrap(~metric, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Calibration risk and intervention workload across thresholds",
+    subtitle = "Dotted lines mark the five alpha risk targets",
+    x = expression(tau), y = NULL, color = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+p_threshold
+save_plot(p_threshold, "06_value_exposure_and_intervention_by_threshold.png", height = 7)
+```
+
+# Category-aware CRC extension
+
+Restricted to $\alpha = 0.05$ as the representative target for this audit (the code is written to accept any `alpha`, so this loop can be re-run at any of the five targets by changing the argument). Categories with fewer than `MIN_CATEGORY_SUPPORT` calibration rows fall back to the global threshold rather than fitting an unstable category-specific one.
+
+```{r category-aware-crc}
+CATEGORY_ALPHA <- 0.05
+MIN_CATEGORY_SUPPORT <- 500
+
+global_sel <- crc_select_threshold(
+  crc_calibration_scored$isReturned,
+  crc_calibration_scored$value_exposure,
+  crc_calibration_scored$calibrated_prob,
+  CATEGORY_ALPHA
+)
+
+category_levels <- unique(as.character(
+  crc_calibration_scored[!is.na(productType), productType]
+))
+
+category_thresholds <- rbindlist(lapply(category_levels, function(cat) {
+  sub <- crc_calibration_scored[productType == cat & !is.na(value_exposure)]
+  n_sub <- nrow(sub)
+
+  if (n_sub < MIN_CATEGORY_SUPPORT) {
+    return(data.table(
+      productType = cat, n_calibration = n_sub,
+      tau = global_sel$tau, used_global_fallback = TRUE
+    ))
+  }
+
+  sel <- crc_select_threshold(sub$isReturned, sub$value_exposure, sub$calibrated_prob, CATEGORY_ALPHA)
+  data.table(productType = cat, n_calibration = n_sub, tau = sel$tau, used_global_fallback = FALSE)
+}))
+
+# Worst-category-risk comparison: apply the GLOBAL threshold vs. each
+# CATEGORY-SPECIFIC threshold on the (unseen) IID holdout split.
+worst_category_risk <- rbindlist(lapply(category_levels, function(cat) {
+  sub <- iid_holdout_scored[productType == cat & !is.na(value_exposure)]
+  if (nrow(sub) == 0) return(NULL)
+
+  cat_tau <- category_thresholds[productType == cat, tau]
+
+  global_eval <- evaluate_threshold(sub$isReturned, sub$value_exposure, sub$calibrated_prob, global_sel$tau)
+  category_eval <- evaluate_threshold(sub$isReturned, sub$value_exposure, sub$calibrated_prob, cat_tau)
+
+  data.table(
+    productType = cat,
+    n_holdout = nrow(sub),
+    risk_with_global_threshold = global_eval$risk,
+    risk_with_category_threshold = category_eval$risk,
+    risk_exceeds_alpha_with_global = global_eval$risk >= CATEGORY_ALPHA
+  )
+}))
+setorder(worst_category_risk, -risk_with_global_threshold)
+
+fwrite(category_thresholds, file.path(TABLE_DIR, "model_05_category_thresholds.csv"))
+fwrite(worst_category_risk, file.path(TABLE_DIR, "model_06_worst_category_risk.csv"))
+
+category_thresholds
+worst_category_risk
+```
+
+```{r category-risk-plot}
+p_category <- ggplot(worst_category_risk, aes(x = reorder(productType, risk_with_global_threshold))) +
+  geom_col(aes(y = risk_with_global_threshold, fill = "Global threshold"), width = 0.35,
+           position = position_nudge(x = -0.2)) +
+  geom_col(aes(y = risk_with_category_threshold, fill = "Category threshold"), width = 0.35,
+           position = position_nudge(x = 0.2)) +
+  geom_hline(yintercept = CATEGORY_ALPHA, linetype = "dashed", color = "black") +
+  coord_flip() +
+  scale_fill_manual(values = c("Global threshold" = "#C44E52", "Category threshold" = "#4C72B0")) +
+  labs(
+    title = paste0("Holdout risk by product type at alpha = ", CATEGORY_ALPHA),
+    subtitle = "Dashed line = risk target. Global threshold can leave some categories over target.",
+    x = NULL, y = "Empirical risk", fill = NULL
+  ) +
+  theme_minimal(base_size = 12)
+
+p_category
+save_plot(p_category, "09_category_aware_crc_risk.png")
+```
+
+# Subgroup / intervention-burden audit
+
+**Diagnostic only.** This audit checks whether the chosen policy's workload and missed-value exposure fall disproportionately on some customer groups — it is not used to change the threshold or to treat any group differently.
+
+```{r subgroup-audit}
+SUBGROUP_ALPHA <- 0.05
+subgroup_tau <- crc_target_results[alpha == SUBGROUP_ALPHA, tau]
+
+subgroup_cols <- c("age_band", "shippingCountry", "isMale", "premier")
+
+subgroup_audit <- rbindlist(lapply(subgroup_cols, function(col) {
+  iid_holdout_scored[!is.na(value_exposure), .(
+    subgroup_variable = col,
+    subgroup_value = as.character(get(col)),
+    n = .N,
+    intervention_rate = mean(calibrated_prob >= subgroup_tau),
+    false_negative_exposure = mean(isReturned * value_exposure * (calibrated_prob < subgroup_tau))
+  ), by = col][, (col) := NULL][]
+}))
+
+burden_gaps <- subgroup_audit[, .(
+  intervention_rate_gap = max(intervention_rate) - min(intervention_rate),
+  false_negative_exposure_gap = max(false_negative_exposure) - min(false_negative_exposure),
+  highest_missed_exposure_group = subgroup_value[which.max(false_negative_exposure)]
+), by = subgroup_variable]
+
+fwrite(subgroup_audit, file.path(TABLE_DIR, "model_07_subgroup_audit.csv"))
+fwrite(burden_gaps, file.path(TABLE_DIR, "model_08_subgroup_burden_gaps.csv"))
+
+subgroup_audit
+burden_gaps
+```
+
+# Future-period drift audit
+
+The recalibration-alert rule is fixed **here, before** looking at the actual drift numbers below, specifically to avoid post-hoc rationalization:
+
+- **PSI \> 0.25** on any monitored input or on the calibrated-probability distribution → flag for review.
+- **Empirical risk on the future-test split exceeds its alpha target** (already visible in `crc_target_results$risk_target_met_on_future_test`) → flag for review regardless of PSI.
+- Either flag → recommend re-running calibration and CRC threshold selection on more recent data before continuing to use the current threshold in production; it does **not** by itself mean the model is unusable.
+
+```{r drift-helpers}
+psi <- function(expected, actual, n_bins = 10) {
+  ok_e <- !is.na(expected); ok_a <- !is.na(actual)
+  expected <- expected[ok_e]; actual <- actual[ok_a]
+
+  breaks <- unique(quantile(expected, probs = seq(0, 1, length.out = n_bins + 1), names = FALSE))
+  breaks[1] <- -Inf; breaks[length(breaks)] <- Inf
+  if (length(breaks) < 3) return(NA_real_)
+
+  e_counts <- table(cut(expected, breaks, include.lowest = TRUE))
+  a_counts <- table(cut(actual, breaks, include.lowest = TRUE))
+  e_pct <- pmax(as.numeric(e_counts) / sum(e_counts), 1e-6)
+  a_pct <- pmax(as.numeric(a_counts) / sum(a_counts), 1e-6)
+
+  sum((a_pct - e_pct) * log(a_pct / e_pct))
+}
+
+ks_two_sample <- function(x, y) {
+  x <- x[is.finite(x)]
+  y <- y[is.finite(y)]
+  if (length(x) == 0 || length(y) == 0) return(NA_real_)
+  suppressWarnings(as.numeric(ks.test(x, y)$statistic))
+}
+
+js_divergence <- function(expected, actual, n_bins = 10) {
+  ok_e <- !is.na(expected); ok_a <- !is.na(actual)
+  expected <- expected[ok_e]; actual <- actual[ok_a]
+
+  breaks <- unique(quantile(c(expected, actual), probs = seq(0, 1, length.out = n_bins + 1), names = FALSE))
+  breaks[1] <- -Inf; breaks[length(breaks)] <- Inf
+  if (length(breaks) < 3) return(NA_real_)
+
+  p <- pmax(as.numeric(table(cut(expected, breaks, include.lowest = TRUE))) / length(expected), 1e-6)
+  q <- pmax(as.numeric(table(cut(actual, breaks, include.lowest = TRUE))) / length(actual), 1e-6)
+  m <- (p + q) / 2
+
+  0.5 * sum(p * log(p / m)) + 0.5 * sum(q * log(q / m))
+}
+```
+
+```{r drift-audit}
+DRIFT_MONITORED_COLUMNS <- c(
+  "avgGbpPrice", "customerReturnRate", "productReturnRate", "discount_ratio"
+)
+
+drift_summary <- rbindlist(lapply(DRIFT_MONITORED_COLUMNS, function(col) {
+  data.table(
+    variable = col,
+    psi = psi(crc_calibration_scored[[col]], future_test_scored[[col]]),
+    ks_statistic = ks_two_sample(crc_calibration_scored[[col]], future_test_scored[[col]]),
+    js_divergence = js_divergence(crc_calibration_scored[[col]], future_test_scored[[col]])
+  )
+}))
+
+# Predicted-probability drift gets its own row, since this is the quantity
+# the CRC threshold is actually applied to.
+drift_summary <- rbind(drift_summary, data.table(
+  variable = "calibrated_prob",
+  psi = psi(crc_calibration_scored$calibrated_prob, future_test_scored$calibrated_prob),
+  ks_statistic = ks_two_sample(crc_calibration_scored$calibrated_prob, future_test_scored$calibrated_prob),
+  js_divergence = js_divergence(crc_calibration_scored$calibrated_prob, future_test_scored$calibrated_prob)
+))
+
+drift_summary[, psi_flag := psi > 0.25]
+
+fwrite(drift_summary, file.path(TABLE_DIR, "model_09_drift_summary.csv"))
+drift_summary
+```
+
+```{r calibration-error-change}
+brier_calib_ref <- brier_score(crc_calibration_scored$isReturned, crc_calibration_scored$calibrated_prob)
+brier_future <- brier_score(future_test_scored$isReturned, future_test_scored$calibrated_prob)
+
+calibration_error_change <- data.table(
+  split = c("crc_calibration (reference)", "official_future_test"),
+  brier_score = c(brier_calib_ref, brier_future),
+  brier_change_vs_reference = c(0, brier_future - brier_calib_ref)
+)
+
+fwrite(calibration_error_change, file.path(TABLE_DIR, "model_10_calibration_error_change.csv"))
+calibration_error_change
+```
+
+```{r recalibration-alert}
+any_psi_flag <- any(drift_summary$psi_flag, na.rm = TRUE)
+any_risk_target_missed <- any(!crc_target_results$risk_target_met_on_future_test)
+
+recalibration_alert <- data.table(
+  psi_flag_triggered = any_psi_flag,
+  risk_target_missed_on_future_test = any_risk_target_missed,
+  recalibration_recommended = any_psi_flag || any_risk_target_missed
+)
+
+fwrite(recalibration_alert, file.path(TABLE_DIR, "model_11_recalibration_alert.csv"))
+recalibration_alert
+```
+
+::: callout-important
+**Read this table, don't just log it.** If `recalibration_recommended` is `TRUE`, the honest conclusion for the report is that the current threshold should be re-derived from more recent data before being trusted in production — not that the CRC method has failed. The whole point of running this audit is to catch exactly this kind of quiet drift before it becomes a production problem.
+:::
+
+# Stage 3 checklist — confirm before moving on
+
+- [ ] `models/r_preprocessor.rds`, `models/r_logistic_baseline.rds`, and `models/r_calibrator.rds` all exist
+- [ ] `outputs/tables/model_01_calibration_comparison.csv` through `model_11_recalibration_alert.csv` all exist
+- [ ] `outputs/figures/06_value_exposure_and_intervention_by_threshold.png`, `07_calibration_curve.png`, and `09_category_aware_crc_risk.png` all exist
+- [ ] You've inspected `risk_target_met_on_holdout` for every alpha in `crc_target_results`. A `TRUE` for every alpha is expected under the formal CRC guarantee, but a `FALSE` is not automatically an upstream bug -- it's an empirical outcome to investigate (e.g. via the predictor-completeness and model-validity gates above) and report honestly, not silently reinterpret
+- [ ] You've read `recalibration_alert` and know which way it came out
+
+Once every box is checked, every number and figure referenced in Sections 8–11 of the project report has an actual, reproducible source — and you're ready to write the final report itself.
+
+```{r session-info}
+sessionInfo()
+```
+
+```{r}
+# ============================================================
+# FINAL STAGE 3 EVALUATION
+# ============================================================
+
+cat("\n")
+cat("============================================================\n")
+cat("FINAL STAGE 3 EVALUATION\n")
+cat("============================================================\n\n")
+
+
+# ------------------------------------------------------------
+# 1. REQUIRED OUTPUT FILE CHECK
+# ------------------------------------------------------------
+
+required_model_files <- c(
+  "r_preprocessor.rds",
+  "r_logistic_baseline.rds",
+  "r_calibrator.rds"
+)
+
+required_model_paths <- file.path(
+  MODEL_DIR,
+  required_model_files
+)
+
+required_table_files <- c(
+  "model_01_calibration_comparison.csv",
+  "model_02_calibration_curve.csv",
+  "model_04_crc_target_results.csv",
+  "model_05_category_thresholds.csv",
+  "model_06_worst_category_risk.csv",
+  "model_07_subgroup_audit.csv",
+  "model_08_subgroup_burden_gaps.csv",
+  "model_09_drift_summary.csv",
+  "model_10_calibration_error_change.csv",
+  "model_11_recalibration_alert.csv"
+)
+
+required_table_paths <- file.path(
+  TABLE_DIR,
+  required_table_files
+)
+
+required_figure_files <- c(
+  "06_value_exposure_and_intervention_by_threshold.png",
+  "07_calibration_curve.png",
+  "09_category_aware_crc_risk.png"
+)
+
+required_figure_paths <- file.path(
+  FIGURE_DIR,
+  required_figure_files
+)
+
+model_file_status <- data.table(
+  file = required_model_files,
+  exists = file.exists(required_model_paths)
+)
+
+table_file_status <- data.table(
+  file = required_table_files,
+  exists = file.exists(required_table_paths)
+)
+
+figure_file_status <- data.table(
+  file = required_figure_files,
+  exists = file.exists(required_figure_paths)
+)
+
+cat("MODEL FILES:\n")
+print(model_file_status)
+
+cat("\nTABLE FILES:\n")
+print(table_file_status)
+
+cat("\nFIGURE FILES:\n")
+print(figure_file_status)
+
+if (any(!model_file_status$exists)) {
+  stop("Stage 3 evaluation failed: one or more required model files are missing.")
+}
+
+if (any(!table_file_status$exists)) {
+  stop("Stage 3 evaluation failed: one or more required table files are missing.")
+}
+
+if (any(!figure_file_status$exists)) {
+  stop("Stage 3 evaluation failed: one or more required figure files are missing.")
+}
+
+cat("\nPASS: all required Stage 3 output files exist.\n")
+
+
+# ------------------------------------------------------------
+# 2. MODEL INTEGRITY CHECK
+# ------------------------------------------------------------
+
+saved_baseline_model <- readRDS(
+  file.path(MODEL_DIR, "r_logistic_baseline.rds")
+)
+
+saved_calibrator <- readRDS(
+  file.path(MODEL_DIR, "r_calibrator.rds")
+)
+
+saved_preprocessor <- readRDS(
+  file.path(MODEL_DIR, "r_preprocessor.rds")
+)
+
+saved_coef <- coef(saved_baseline_model)
+
+model_integrity <- data.table(
+  n_coefficients = length(saved_coef),
+  n_nonfinite_coefficients = sum(!is.finite(saved_coef)),
+  calibrator_method = saved_calibrator$method,
+  preprocessor_training_n = saved_preprocessor$fitted_on_n
+)
+
+cat("\nMODEL INTEGRITY:\n")
+print(model_integrity)
+
+if (any(!is.finite(saved_coef))) {
+  stop(
+    "Stage 3 evaluation failed: saved baseline model contains ",
+    sum(!is.finite(saved_coef)),
+    " non-finite coefficient(s)."
+  )
+}
+
+if (!saved_calibrator$method %in% c("raw", "platt", "isotonic")) {
+  stop(
+    "Stage 3 evaluation failed: unknown calibration method: ",
+    saved_calibrator$method
+  )
+}
+
+cat("\nPASS: saved model and calibrator are valid.\n")
+
+
+# ------------------------------------------------------------
+# 3. PREDICTION VALIDITY CHECK
+# ------------------------------------------------------------
+
+prediction_objects <- list(
+  validation = validation_scored,
+  crc_calibration = crc_calibration_scored,
+  iid_holdout = iid_holdout_scored,
+  future_test = future_test_scored
+)
+
+prediction_validity <- rbindlist(
+  lapply(names(prediction_objects), function(nm) {
+    
+    dt <- prediction_objects[[nm]]
+    
+    data.table(
+      split = nm,
+      n = nrow(dt),
+      raw_prob_na = sum(is.na(dt$raw_prob)),
+      raw_prob_nonfinite = sum(!is.finite(dt$raw_prob)),
+      calibrated_prob_na = sum(is.na(dt$calibrated_prob)),
+      calibrated_prob_nonfinite =
+        sum(!is.finite(dt$calibrated_prob)),
+      calibrated_prob_below_0 =
+        sum(dt$calibrated_prob < 0, na.rm = TRUE),
+      calibrated_prob_above_1 =
+        sum(dt$calibrated_prob > 1, na.rm = TRUE),
+      exposure_na = sum(is.na(dt$value_exposure)),
+      exposure_nonfinite =
+        sum(!is.finite(dt$value_exposure)),
+      exposure_below_0 =
+        sum(dt$value_exposure < 0, na.rm = TRUE),
+      exposure_above_1 =
+        sum(dt$value_exposure > 1, na.rm = TRUE)
+    )
+  })
+)
+
+cat("\nPREDICTION VALIDITY:\n")
+print(prediction_validity)
+
+fwrite(
+  prediction_validity,
+  file.path(TABLE_DIR, "model_12_final_prediction_validity.csv")
+)
+
+if (any(prediction_validity$raw_prob_na > 0) ||
+    any(prediction_validity$raw_prob_nonfinite > 0) ||
+    any(prediction_validity$calibrated_prob_na > 0) ||
+    any(prediction_validity$calibrated_prob_nonfinite > 0)) {
+  
+  stop(
+    "Stage 3 evaluation failed: invalid prediction probabilities detected."
+  )
+}
+
+if (any(prediction_validity$calibrated_prob_below_0 > 0) ||
+    any(prediction_validity$calibrated_prob_above_1 > 0)) {
+  
+  stop(
+    "Stage 3 evaluation failed: calibrated probabilities outside [0,1]."
+  )
+}
+
+if (any(prediction_validity$exposure_below_0 > 0) ||
+    any(prediction_validity$exposure_above_1 > 0)) {
+  
+  stop(
+    "Stage 3 evaluation failed: value_exposure is outside [0,1]."
+  )
+}
+
+cat("\nPASS: all probabilities and value exposures are valid.\n")
+
+
+# ------------------------------------------------------------
+# 4. CLASS DISTRIBUTION CHECK
+# ------------------------------------------------------------
+
+class_summary <- rbindlist(
+  lapply(names(prediction_objects), function(nm) {
+    
+    dt <- prediction_objects[[nm]]
+    
+    data.table(
+      split = nm,
+      n = nrow(dt),
+      returned = sum(dt$isReturned == 1, na.rm = TRUE),
+      non_returned = sum(dt$isReturned == 0, na.rm = TRUE),
+      return_rate = mean(dt$isReturned, na.rm = TRUE)
+    )
+  })
+)
+
+cat("\nCLASS DISTRIBUTION:\n")
+print(class_summary)
+
+fwrite(
+  class_summary,
+  file.path(TABLE_DIR, "model_13_stage3_class_summary.csv")
+)
+
+
+# ------------------------------------------------------------
+# 5. RAW MODEL PERFORMANCE
+# ------------------------------------------------------------
+
+raw_model_performance <- data.table(
+  split = "validation",
+  auc = val_auc,
+  pr_auc = val_prauc,
+  brier = val_brier_raw,
+  log_loss = val_logloss_raw
+)
+
+cat("\nRAW MODEL PERFORMANCE:\n")
+print(raw_model_performance)
+
+fwrite(
+  raw_model_performance,
+  file.path(TABLE_DIR, "model_14_raw_model_performance.csv")
+)
+
+
+# ------------------------------------------------------------
+# 6. CALIBRATION COMPARISON
+# ------------------------------------------------------------
+
+calibration_comparison_final <- copy(
+  calibration_comparison
+)
+
+calibration_comparison_final[
+  ,
+  selected := method == best_method
+]
+
+calibration_comparison_final[
+  ,
+  brier_improvement_vs_raw :=
+    calibration_comparison_final[
+      method == "raw",
+      brier
+    ][1] - brier
+]
+
+calibration_comparison_final[
+  ,
+  logloss_improvement_vs_raw :=
+    calibration_comparison_final[
+      method == "raw",
+      log_loss
+    ][1] - log_loss
+]
+
+cat("\nCALIBRATION COMPARISON:\n")
+print(calibration_comparison_final)
+
+fwrite(
+  calibration_comparison_final,
+  file.path(TABLE_DIR, "model_15_calibration_final_evaluation.csv")
+)
+
+cat(
+  "\nSelected calibration method:",
+  best_method,
+  "\n"
+)
+
+
+# ------------------------------------------------------------
+# 7. CALIBRATION CURVE QUALITY CHECK
+# ------------------------------------------------------------
+
+calibration_curve_check <- data.table(
+  n_bins = nrow(cal_curve),
+  mean_absolute_calibration_gap =
+    mean(abs(
+      cal_curve$mean_predicted -
+        cal_curve$empirical_rate
+    )),
+  maximum_calibration_gap =
+    max(abs(
+      cal_curve$mean_predicted -
+        cal_curve$empirical_rate
+    )),
+  correlation_predicted_empirical =
+    cor(
+      cal_curve$mean_predicted,
+      cal_curve$empirical_rate
+    )
+)
+
+cat("\nCALIBRATION CURVE QUALITY:\n")
+print(calibration_curve_check)
+
+fwrite(
+  calibration_curve_check,
+  file.path(TABLE_DIR, "model_16_calibration_curve_quality.csv")
+)
+
+
+# ------------------------------------------------------------
+# 8. CALIBRATED PERFORMANCE ON EACH EVALUATION SPLIT
+# ------------------------------------------------------------
+
+calibrated_performance <- rbindlist(
+  lapply(names(prediction_objects), function(nm) {
+    
+    dt <- prediction_objects[[nm]]
+    
+    data.table(
+      split = nm,
+      auc = auc_roc(
+        dt$isReturned,
+        dt$calibrated_prob
+      ),
+      pr_auc = pr_auc(
+        dt$isReturned,
+        dt$calibrated_prob
+      ),
+      brier = brier_score(
+        dt$isReturned,
+        dt$calibrated_prob
+      ),
+      log_loss = log_loss(
+        dt$isReturned,
+        dt$calibrated_prob
+      ),
+      mean_predicted_probability =
+        mean(dt$calibrated_prob),
+      observed_return_rate =
+        mean(dt$isReturned)
+    )
+  })
+)
+
+cat("\nCALIBRATED MODEL PERFORMANCE:\n")
+print(calibrated_performance)
+
+fwrite(
+  calibrated_performance,
+  file.path(TABLE_DIR, "model_17_calibrated_performance.csv")
+)
+
+
+# ------------------------------------------------------------
+# 9. CRC TARGET EVALUATION
+# ------------------------------------------------------------
+
+crc_eval <- copy(
+  crc_target_results
+)
+
+crc_eval[
+  ,
+  holdout_margin_to_target :=
+    alpha - iid_holdout_risk
+]
+
+crc_eval[
+  ,
+  future_margin_to_target :=
+    alpha - future_test_risk
+]
+
+crc_eval[
+  ,
+  formal_holdout_check :=
+    iid_holdout_risk < alpha
+]
+
+crc_eval[
+  ,
+  future_robustness_check :=
+    future_test_risk < alpha
+]
+
+cat("\nCRC TARGET EVALUATION:\n")
+print(crc_eval)
+
+fwrite(
+  crc_eval,
+  file.path(TABLE_DIR, "model_18_crc_final_evaluation.csv")
+)
+
+cat("\nFormal IID-holdout target results:\n")
+
+print(
+  crc_eval[
+    ,
+    .(
+      alpha,
+      tau,
+      iid_holdout_risk,
+      iid_holdout_intervention_rate,
+      formal_holdout_check
+    )
+  ]
+)
+
+
+# ------------------------------------------------------------
+# 10. FORMAL CRC HOLDOUT CHECK
+# ------------------------------------------------------------
+
+all_formal_targets_met <- all(
+  crc_eval$formal_holdout_check
+)
+
+if (all_formal_targets_met) {
+  
+  cat(
+    "\nPASS: every tested alpha target was met on the IID holdout.\n"
+  )
+  
+} else {
+  
+  cat(
+    "\nNOTICE: one or more empirical IID-holdout risks ",
+    "exceeded the requested alpha target.\n"
+  )
+  
+  print(
+    crc_eval[
+      !formal_holdout_check,
+      .(
+        alpha,
+        tau,
+        iid_holdout_risk
+      )
+    ]
+  )
+}
+
+
+# ------------------------------------------------------------
+# 11. INTERVENTION-WORKLOAD SUMMARY
+# ------------------------------------------------------------
+
+intervention_summary <- crc_eval[
+  ,
+  .(
+    alpha,
+    tau,
+    calibration_intervention_rate,
+    iid_holdout_intervention_rate,
+    future_test_intervention_rate
+  )
+]
+
+cat("\nINTERVENTION WORKLOAD:\n")
+print(intervention_summary)
+
+fwrite(
+  intervention_summary,
+  file.path(TABLE_DIR, "model_19_intervention_workload.csv")
+)
+
+
+# ------------------------------------------------------------
+# 12. COST / EXPOSURE SUMMARY
+# ------------------------------------------------------------
+
+exposure_summary <- rbindlist(
+  lapply(
+    list(
+      calibration = crc_calibration_scored,
+      iid_holdout = iid_holdout_scored,
+      future_test = future_test_scored
+    ),
+    function(dt) {
+      
+      data.table(
+        split = names(
+          list(
+            calibration = crc_calibration_scored,
+            iid_holdout = iid_holdout_scored,
+            future_test = future_test_scored
+          )
+        )[1],
+        mean_value_exposure =
+          mean(dt$value_exposure),
+        median_value_exposure =
+          median(dt$value_exposure),
+        p95_value_exposure =
+          quantile(
+            dt$value_exposure,
+            0.95
+          ),
+        max_value_exposure =
+          max(dt$value_exposure)
+      )
+    }
+  )
+)
+
+# Rebuild correctly with explicit names
+exposure_summary <- rbindlist(
+  list(
+    data.table(
+      split = "crc_calibration",
+      mean_value_exposure =
+        mean(crc_calibration_scored$value_exposure),
+      median_value_exposure =
+        median(crc_calibration_scored$value_exposure),
+      p95_value_exposure =
+        quantile(
+          crc_calibration_scored$value_exposure,
+          0.95
+        ),
+      max_value_exposure =
+        max(crc_calibration_scored$value_exposure)
+    ),
+    data.table(
+      split = "iid_holdout",
+      mean_value_exposure =
+        mean(iid_holdout_scored$value_exposure),
+      median_value_exposure =
+        median(iid_holdout_scored$value_exposure),
+      p95_value_exposure =
+        quantile(
+          iid_holdout_scored$value_exposure,
+          0.95
+        ),
+      max_value_exposure =
+        max(iid_holdout_scored$value_exposure)
+    ),
+    data.table(
+      split = "future_test",
+      mean_value_exposure =
+        mean(future_test_scored$value_exposure),
+      median_value_exposure =
+        median(future_test_scored$value_exposure),
+      p95_value_exposure =
+        quantile(
+          future_test_scored$value_exposure,
+          0.95
+        ),
+      max_value_exposure =
+        max(future_test_scored$value_exposure)
+    )
+  )
+)
+
+cat("\nVALUE EXPOSURE SUMMARY:\n")
+print(exposure_summary)
+
+fwrite(
+  exposure_summary,
+  file.path(TABLE_DIR, "model_20_value_exposure_summary.csv")
+)
+
+
+# ------------------------------------------------------------
+# 13. CATEGORY-AWARE CRC EVALUATION
+# ------------------------------------------------------------
+
+category_eval <- copy(
+  worst_category_risk
+)
+
+category_eval[
+  ,
+  global_over_target :=
+    risk_with_global_threshold >= CATEGORY_ALPHA
+]
+
+category_eval[
+  ,
+  category_over_target :=
+    risk_with_category_threshold >= CATEGORY_ALPHA
+]
+
+category_eval[
+  ,
+  risk_change_category_minus_global :=
+    risk_with_category_threshold -
+    risk_with_global_threshold
+]
+
+category_eval[
+  ,
+  threshold_used :=
+    category_thresholds[
+      match(
+        productType,
+        category_thresholds$productType
+      ),
+      tau
+    ]
+]
+
+cat("\nCATEGORY-AWARE CRC EVALUATION:\n")
+print(category_eval)
+
+fwrite(
+  category_eval,
+  file.path(TABLE_DIR, "model_21_category_crc_final_evaluation.csv")
+)
+
+cat(
+  "\nCategories evaluated:",
+  nrow(category_eval),
+  "\n"
+)
+
+cat(
+  "Categories above alpha under global threshold:",
+  sum(category_eval$global_over_target),
+  "\n"
+)
+
+cat(
+  "Categories above alpha under category threshold:",
+  sum(category_eval$category_over_target),
+  "\n"
+)
+
+
+# ------------------------------------------------------------
+# 14. CATEGORY THRESHOLD DIFFERENCES
+# ------------------------------------------------------------
+
+category_threshold_eval <- copy(
+  category_thresholds
+)
+
+category_threshold_eval[
+  ,
+  threshold_difference_from_global :=
+    tau - global_sel$tau
+]
+
+category_threshold_eval[
+  ,
+  absolute_threshold_difference :=
+    abs(tau - global_sel$tau)
+]
+
+cat("\nCATEGORY THRESHOLD DIFFERENCES:\n")
+print(category_threshold_eval)
+
+fwrite(
+  category_threshold_eval,
+  file.path(TABLE_DIR, "model_22_category_threshold_differences.csv")
+)
+
+
+# ------------------------------------------------------------
+# 15. SUBGROUP BURDEN EVALUATION
+# ------------------------------------------------------------
+
+subgroup_eval <- copy(
+  subgroup_audit
+)
+
+subgroup_eval[
+  ,
+  subgroup_intervention_rate_percent :=
+    100 * intervention_rate
+]
+
+subgroup_eval[
+  ,
+  subgroup_missed_exposure_percent :=
+    100 * false_negative_exposure
+]
+
+cat("\nSUBGROUP / INTERVENTION-BURDEN AUDIT:\n")
+print(subgroup_eval)
+
+fwrite(
+  subgroup_eval,
+  file.path(TABLE_DIR, "model_23_subgroup_final_evaluation.csv")
+)
+
+cat("\nSUBGROUP BURDEN GAPS:\n")
+print(burden_gaps)
+
+
+# ------------------------------------------------------------
+# 16. FUTURE DRIFT EVALUATION
+# ------------------------------------------------------------
+
+drift_eval <- copy(
+  drift_summary
+)
+
+drift_eval[
+  ,
+  psi_severity :=
+    fifelse(
+      is.na(psi),
+      "unavailable",
+      fifelse(
+        psi > 0.25,
+        "flag",
+        "below_threshold"
+      )
+    )
+]
+
+cat("\nFUTURE-PERIOD DRIFT:\n")
+print(drift_eval)
+
+fwrite(
+  drift_eval,
+  file.path(TABLE_DIR, "model_24_future_drift_final_evaluation.csv")
+)
+
+
+# ------------------------------------------------------------
+# 17. FUTURE CALIBRATION CHANGE
+# ------------------------------------------------------------
+
+future_calibration_eval <- copy(
+  calibration_error_change
+)
+
+future_calibration_eval[
+  ,
+  absolute_brier_change :=
+    abs(brier_change_vs_reference)
+]
+
+cat("\nFUTURE CALIBRATION CHANGE:\n")
+print(future_calibration_eval)
+
+fwrite(
+  future_calibration_eval,
+  file.path(TABLE_DIR, "model_25_future_calibration_evaluation.csv")
+)
+
+
+# ------------------------------------------------------------
+# 18. FINAL RECALIBRATION DECISION
+# ------------------------------------------------------------
+
+final_recalibration_flag <- data.table(
+  psi_flag_triggered =
+    any_psi_flag,
+  
+  future_risk_target_missed =
+    any_risk_target_missed,
+  
+  recalibration_recommended =
+    any_psi_flag ||
+    any_risk_target_missed
+)
+
+cat("\nFINAL RECALIBRATION STATUS:\n")
+print(final_recalibration_flag)
+
+if (final_recalibration_flag$recalibration_recommended) {
+  
+  cat(
+    "\nREVIEW SIGNAL: recalibration / threshold re-selection ",
+    "is recommended before production use.\n"
+  )
+  
+} else {
+  
+  cat(
+    "\nNO RE-TRAINING ALERT: the predefined drift/risk ",
+    "monitoring rules did not trigger.\n"
+  )
+}
+
+
+# ------------------------------------------------------------
+# 19. INTERNAL CONSISTENCY CHECKS
+# ------------------------------------------------------------
+
+consistency_checks <- data.table(
+  check = c(
+    "baseline coefficients finite",
+    "all raw probabilities finite",
+    "all calibrated probabilities finite",
+    "calibrated probabilities within [0,1]",
+    "value exposure within [0,1]",
+    "calibration method valid",
+    "required model files exist",
+    "required tables exist",
+    "required figures exist",
+    "formal holdout CRC targets all met"
+  ),
+  
+  pass = c(
+    all(is.finite(saved_coef)),
+    all(prediction_validity$raw_prob_nonfinite == 0),
+    all(prediction_validity$calibrated_prob_nonfinite == 0),
+    all(
+      prediction_validity$calibrated_prob_below_0 == 0 &
+        prediction_validity$calibrated_prob_above_1 == 0
+    ),
+    all(
+      prediction_validity$exposure_below_0 == 0 &
+        prediction_validity$exposure_above_1 == 0
+    ),
+    saved_calibrator$method %in%
+      c("raw", "platt", "isotonic"),
+    all(model_file_status$exists),
+    all(table_file_status$exists),
+    all(figure_file_status$exists),
+    all_formal_targets_met
+  )
+)
+
+cat("\n============================================================\n")
+cat("FINAL CONSISTENCY CHECKS\n")
+cat("============================================================\n")
+
+print(consistency_checks)
+
+fwrite(
+  consistency_checks,
+  file.path(TABLE_DIR, "model_26_final_stage3_consistency_checks.csv")
+)
+
+
+# ------------------------------------------------------------
+# 20. FINAL STAGE 3 STATUS
+# ------------------------------------------------------------
+
+stage3_pass <- all(consistency_checks$pass)
+
+final_status <- data.table(
+  stage = "Stage 3",
+  baseline_model_valid =
+    all(is.finite(saved_coef)),
+  predictions_valid =
+    all(
+      prediction_validity$raw_prob_nonfinite == 0 &
+        prediction_validity$calibrated_prob_nonfinite == 0
+    ),
+  calibration_completed =
+    saved_calibrator$method %in%
+    c("raw", "platt", "isotonic"),
+  crc_completed =
+    nrow(crc_target_results) ==
+    length(ALPHA_GRID),
+  category_crc_completed =
+    nrow(category_thresholds) > 0,
+  subgroup_audit_completed =
+    nrow(subgroup_audit) > 0,
+  future_drift_audit_completed =
+    nrow(drift_summary) > 0,
+  formal_crc_targets_all_met =
+    all_formal_targets_met,
+  recalibration_recommended =
+    final_recalibration_flag$recalibration_recommended,
+  overall_stage3_pass =
+    stage3_pass
+)
+
+cat("\n============================================================\n")
+cat("FINAL STAGE 3 STATUS\n")
+cat("============================================================\n")
+
+print(final_status)
+
+fwrite(
+  final_status,
+  file.path(TABLE_DIR, "model_27_final_stage3_status.csv")
+)
+
+if (stage3_pass) {
+  
+  cat(
+    "\n============================================================\n",
+    "STAGE 3 EVALUATION: PASS\n",
+    "============================================================\n",
+    sep = ""
+  )
+  
+} else {
+  
+  cat(
+    "\n============================================================\n",
+    "STAGE 3 EVALUATION: REVIEW REQUIRED\n",
+    "============================================================\n",
+    sep = ""
+  )
+}
+```

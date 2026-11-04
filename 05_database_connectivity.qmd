@@ -1,0 +1,267 @@
+---
+title: "CostConformal-Return — Stage 5: Database Connectivity and Retrieval"
+subtitle: "Category-Aware and Future-Period Drift-Audited Conformal Risk Control for Value-Sensitive E-Commerce Returns"
+author: "Simran Kumari (24BDS1031)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    df-print: kable
+    theme: cosmo
+execute:
+  warning: false
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath("."))
+```
+
+# Purpose of this stage
+
+This notebook is **Stage 5** of the pipeline and covers Phase 2's database-connectivity requirement: it moves Stage 4's five `*_features.csv.gz` splits into a real relational database (SQLite, via `DBI`/`RSQLite`) and retrieves data back out using SQL, in R.
+
+**Database choice, stated explicitly:** SQLite rather than MySQL/PostgreSQL/MongoDB. It is file-based, needs no server process, and the `DBI` interface used here (`dbConnect`, `dbWriteTable`, `dbGetQuery`, `dbExecute`) is nearly identical across backends — swapping the driver in `dbConnect()` for `RMariaDB::MariaDB()` or `RPostgres::Postgres()` would port this notebook to a client-server DB with almost no other change, if that's ever required.
+
+This is not a disconnected checkbox stage: `load_split_from_db()`, defined here, is the function **Stage 6's model zoo actually calls** to retrieve training data — so the database is a real part of the pipeline from here on, not a side demo that gets ignored afterward.
+
+**A useful side effect, worth noting given Stage 4's RAM constraints:** the three retrieval queries below (row counts, return rate, category group-by) run their aggregation **inside SQLite**, and only the small aggregated result ever enters R. None of them loads a full table into memory — on a 6 GB machine, this is a genuine advantage of querying a database over `fread()`-ing a whole file just to compute a summary statistic from it.
+
+# Before you render this document
+
+1.  Save this file as `05_database_connectivity.qmd` in the project root.
+2.  Confirm Stage 4's checklist is fully green — the five `data/processed/*_features.csv.gz` files and `models/r_feature_selector.rds` must already exist.
+3.  This stage needs `DBI` and `RSQLite` (auto-installed below if missing).
+4.  Render with `Ctrl/Cmd+Shift+K`, or run chunk-by-chunk.
+
+# Setup
+
+```{r source-setup}
+source(file.path("R", "00_setup.R"))
+data.table::setDTthreads(2)
+
+required_packages <- c("DBI", "RSQLite")
+missing_packages <- setdiff(required_packages, rownames(installed.packages()))
+if (length(missing_packages) > 0) install.packages(missing_packages)
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+DB_PATH <- file.path("data", "costconformal_return.sqlite")
+dir.create("data", showWarnings = FALSE)
+```
+
+```{r load-metadata-and-paths}
+preprocessor <- readRDS(file.path(MODEL_DIR, "r_preprocessor.rds"))
+feature_selector <- readRDS(file.path(MODEL_DIR, "r_feature_selector.rds"))
+
+feature_files <- c(
+  model_train = file.path(PROCESSED_DIR, "model_train_features.csv.gz"),
+  validation = file.path(PROCESSED_DIR, "validation_features.csv.gz"),
+  crc_calibration = file.path(PROCESSED_DIR, "crc_calibration_features.csv.gz"),
+  iid_holdout = file.path(PROCESSED_DIR, "iid_holdout_features.csv.gz"),
+  future_test = file.path(PROCESSED_DIR, "official_future_test_features.csv.gz")
+)
+assert_files_exist(feature_files)
+
+# SQLite has no categorical type -- price_tier/customer_risk_tier round-trip
+# as plain TEXT. Their label sets are rebuilt here, from the same logic
+# Stage 4 used to label them (bin_definitions only stores the numeric break
+# *values*, not the string labels), so retrieval can restore them as factors.
+bin_label_levels <- function(fs) {
+  bd <- fs$bin_definitions
+  list(
+    price_tier = c("Q1_low", "Q2", "Q3", "Q4_high")[seq_len(length(bd$price_breaks) - 1)],
+    customer_risk_tier = c("Low", "Mid", "High")[seq_len(length(bd$risk_breaks) - 1)]
+  )
+}
+BIN_LEVELS <- bin_label_levels(feature_selector)
+```
+
+# Connect
+
+```{r connect}
+con <- dbConnect(RSQLite::SQLite(), DB_PATH)
+cat("Connected to SQLite database at", DB_PATH, "\n")
+```
+
+# Writing each split into the database
+
+One split loaded, written, and freed at a time — the same RAM discipline Stage 4's Phase B used. `fread()` on the `*_features.csv.gz` files already returns plain character columns for `productType`/`price_tier`/etc. (Stage 4's `fwrite()` wrote factor labels out as text), so no factor restoration is needed before `dbWriteTable()` — SQLite wants TEXT columns anyway.
+
+```{r write-splits}
+for (split_name in names(feature_files)) {
+  cat("\n--- Writing split to DB:", split_name, "---\n")
+
+  split_dt <- fread(feature_files[[split_name]])
+  dbWriteTable(con, split_name, split_dt, overwrite = TRUE)
+
+  n_file <- nrow(split_dt)
+  n_db <- dbGetQuery(con, paste0("SELECT COUNT(*) AS n FROM ", split_name))$n
+  if (n_db != n_file) {
+    stop(paste0("Row count mismatch writing ", split_name, ": file had ", n_file, ", DB has ", n_db, "."))
+  }
+  cat("PASS:", split_name, "written --", n_db, "rows confirmed via SQL COUNT(*).\n")
+
+  rm(split_dt)
+  invisible(gc(verbose = FALSE))
+}
+```
+
+## Indexes
+
+Not required at this row count, but costs little and will speed up the category/subgroup queries Stage 8's comparative evaluation runs later.
+
+```{r indexes}
+dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_model_train_producttype ON model_train(productType)")
+dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_model_train_isreturned ON model_train(isReturned)")
+cat("Indexes created on model_train(productType) and model_train(isReturned).\n")
+```
+
+# Retrieval demonstration via SQL
+
+Three queries, each computed entirely inside SQLite -- only the aggregated result (a handful of rows) ever enters R.
+
+## Row counts across all five tables
+
+```{r retrieval-row-counts}
+row_count_query <- paste(
+  sapply(names(feature_files), function(nm) paste0("SELECT '", nm, "' AS split, COUNT(*) AS n_rows FROM ", nm)),
+  collapse = " UNION ALL "
+)
+row_counts_db <- as.data.table(dbGetQuery(con, row_count_query))
+row_counts_db
+fwrite(row_counts_db, file.path(TABLE_DIR, "db_01_row_counts.csv"))
+```
+
+## Return rate by split (SQL `AVG`, not an R-side mean)
+
+```{r retrieval-return-rate}
+return_rate_query <- paste(
+  sapply(names(feature_files), function(nm) paste0("SELECT '", nm, "' AS split, AVG(isReturned) AS return_rate, COUNT(*) AS n FROM ", nm)),
+  collapse = " UNION ALL "
+)
+return_rate_db <- as.data.table(dbGetQuery(con, return_rate_query))
+return_rate_db
+fwrite(return_rate_db, file.path(TABLE_DIR, "db_02_return_rate_by_split.csv"))
+```
+
+## Return rate by `productType` within `model_train` (SQL `GROUP BY`)
+
+Ties back to the Phase 1 EDA finding (report §8.3) that a single global threshold is a poor fit across categories -- reproduced here via SQL aggregation instead of R, as the motivating evidence for Stage 3's category-aware CRC extension.
+
+```{r retrieval-category-groupby}
+category_rate_query <- "
+  SELECT productType, COUNT(*) AS n, AVG(isReturned) AS return_rate
+  FROM model_train
+  GROUP BY productType
+  ORDER BY return_rate DESC
+"
+category_rate_db <- as.data.table(dbGetQuery(con, category_rate_query))
+category_rate_db
+fwrite(category_rate_db, file.path(TABLE_DIR, "db_03_return_rate_by_producttype.csv"))
+```
+
+# Retrieval function for Stage 6: `load_split_from_db()`
+
+Stage 6's model zoo retrieves training data through this function rather than reading the `*_features.csv.gz` files directly -- this is the actual "data retrieval using R" deliverable, not just the one-off demo queries above. Factor levels (frozen back in Stage 1.5/Stage 4) are restored on the way out, the same way `restore_factor_types()` did for the CSV round-trip.
+
+```{r retrieval-function}
+load_split_from_db <- function(con, split_name, preprocessor, feature_selector, bin_levels) {
+  dt <- as.data.table(dbGetQuery(con, paste0("SELECT * FROM ", split_name)))
+
+  for (col in feature_selector$categorical_features) {
+    if (col %in% names(dt)) {
+      levs <- union(preprocessor$allowed_levels[[col]], "OTHER")
+      set(dt, j = col, value = factor(dt[[col]], levels = levs))
+    }
+  }
+  for (col in names(bin_levels)) {
+    if (col %in% names(dt)) {
+      set(dt, j = col, value = factor(dt[[col]], levels = bin_levels[[col]]))
+    }
+  }
+  dt
+}
+```
+
+```{r retrieval-smoke-test}
+validation_from_db <- load_split_from_db(con, "validation", preprocessor, feature_selector, BIN_LEVELS)
+cat("Retrieved 'validation' from the database:", nrow(validation_from_db), "rows,",
+    ncol(validation_from_db), "columns.\n")
+str(validation_from_db[, .(productType, price_tier, customer_risk_tier, isReturned)])
+
+rm(validation_from_db)
+invisible(gc(verbose = FALSE))
+```
+
+# Quality gate
+
+Every check here is cheap by design (`LIMIT 1` / `COUNT(*)`) -- nothing here re-loads a full table just to validate it.
+
+```{r quality-gate}
+cat("\n============================================================\n")
+cat("STAGE 5 QUALITY GATE\n")
+cat("============================================================\n\n")
+
+GATE_PASS <- TRUE
+fail_check <- function(msg) { cat("FAIL:", msg, "\n"); GATE_PASS <<- FALSE }
+pass_check <- function(msg) cat("PASS:", msg, "\n")
+
+if (!file.exists(DB_PATH)) fail_check("Database file does not exist on disk.") else pass_check("Database file exists on disk.")
+
+db_tables <- dbListTables(con)
+expected_tables <- names(feature_files)
+missing_tables <- setdiff(expected_tables, db_tables)
+if (length(missing_tables) > 0) {
+  fail_check(paste("Missing table(s):", paste(missing_tables, collapse = ", ")))
+} else {
+  pass_check("All 5 expected tables present in the database.")
+}
+
+required_cols <- unique(c(
+  "customer_id", "variant_id", "isReturned", "value_exposure",
+  feature_selector$linear_numeric_features, feature_selector$tree_numeric_features,
+  feature_selector$categorical_features, feature_selector$binary_features,
+  feature_selector$missingness_flags, feature_selector$binned_features
+))
+
+for (nm in expected_tables) {
+  one_row <- dbGetQuery(con, paste0("SELECT * FROM ", nm, " LIMIT 1"))
+  missing_cols <- setdiff(required_cols, names(one_row))
+  if (length(missing_cols) > 0) {
+    fail_check(paste(nm, "missing column(s):", paste(missing_cols, collapse = ", ")))
+  } else {
+    pass_check(paste(nm, "has every required column."))
+  }
+}
+
+if (!GATE_PASS) stop("Stage 5 quality gate failed -- see FAIL messages above.")
+cat("\nAll checks passed.\n")
+```
+
+# Disconnect
+
+```{r disconnect}
+dbDisconnect(con)
+cat("Disconnected. Stage 6 opens its own fresh connection to", DB_PATH, "-- the file persists, nothing needs rewriting.\n")
+```
+
+# Stage 5 checklist — confirm before moving on
+
+- [ ] `data/costconformal_return.sqlite` exists on disk
+- [ ] "Processing split: ..." / row-count confirmation appeared 5 times in the console log during the write loop
+- [ ] `outputs/tables/db_01_row_counts.csv`, `db_02_return_rate_by_split.csv`, and `db_03_return_rate_by_producttype.csv` all exist
+- [ ] `db_02_return_rate_by_split.csv` shows the same \~55.3%/54.5% train/future-test split reported in the project report (§3) and Stage 1 -- confirms nothing was corrupted in the DB round-trip
+- [ ] `db_03_return_rate_by_producttype.csv` reproduces the 43.5%-72.1% spread across `productType` already reported in §8.3
+- [ ] The retrieval smoke test printed a `validation` table with `productType`/`price_tier`/`customer_risk_tier` restored as **factors**, not character columns
+- [ ] **STAGE 5 QUALITY GATE: all checks PASS** printed before disconnecting
+
+Stage 6 (the 10–15-model zoo) retrieves every split through `load_split_from_db()` against this same `.sqlite` file, not through `fread()` on the `*_features.csv.gz` files directly -- so if you re-run Stage 4 with any feature change, re-run this stage afterward too, before Stage 6.
+
+```{r session-info}
+sessionInfo()
+```

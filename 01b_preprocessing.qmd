@@ -1,0 +1,1081 @@
+---
+title: "CostConformal-Return — Stage 1.5: Preprocessing (Missing Values, Encoding, Normalization)"
+subtitle: "Category-Aware and Future-Period Drift-Audited Conformal Risk Control for Value-Sensitive E-Commerce Returns"
+author: "Simran Kumari (24BDS1031)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    df-print: kable
+    theme: cosmo
+execute:
+  warning: false
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath("."))
+```
+
+# Purpose of this stage
+
+This notebook runs **after Stage 1 (data preparation) and before Stage 2 (EDA)**. It is the dedicated preprocessing pass — missing-value imputation, categorical encoding, and numeric normalization — as its own auditable stage, rather than something implicit inside the modeling code.
+
+**Why EDA (Stage 2) still reads the *pre*-imputation data, not this stage's output:** EDA's job is to honestly characterize the raw data, including its missingness (e.g. the \~35% product-join gap documented in Stage 1). Imputing before EDA would hide exactly the pattern that analysis is supposed to surface. So the dependency graph is:
+
+```         
+Stage 1 (data prep) ──┬──> Stage 1.5 (this notebook: preprocessing) ──> Stage 3 (modeling)
+                       └──> Stage 2 (EDA, reads pre-imputation data)
+```
+
+Everything here is fit **only on `model_train`** and applied unchanged to `validation`, `crc_calibration`, `iid_holdout`, and `official_future_test` — the same train/calibration/test separation rule Stage 1 already established for the price cap and category medians.
+
+# Before you render this document
+
+1.  Save this file as `01b_preprocessing.qmd` in the project root.
+2.  Confirm Stage 1's checklist is fully green (the six `data/processed/*.csv.gz` files must already exist).
+3.  Render with `Ctrl/Cmd+Shift+K`, or run chunk-by-chunk.
+
+# Setup and data loading
+
+```{r source-setup}
+source(file.path("R", "00_setup.R"))
+```
+
+```{r load-splits}
+split_files <- c(
+  model_train = file.path(PROCESSED_DIR, "model_train.csv.gz"),
+  validation = file.path(PROCESSED_DIR, "validation.csv.gz"),
+  crc_calibration = file.path(PROCESSED_DIR, "crc_calibration.csv.gz"),
+  iid_holdout = file.path(PROCESSED_DIR, "iid_holdout.csv.gz"),
+  future_test = file.path(PROCESSED_DIR, "official_future_test_strict.csv.gz")
+)
+assert_files_exist(split_files)
+
+model_train_dt <- fread(split_files[["model_train"]])
+validation_dt <- fread(split_files[["validation"]])
+crc_calibration_dt <- fread(split_files[["crc_calibration"]])
+iid_holdout_dt <- fread(split_files[["iid_holdout"]])
+future_test_dt <- fread(split_files[["future_test"]])
+
+all_splits <- list(
+  model_train = model_train_dt,
+  validation = validation_dt,
+  crc_calibration = crc_calibration_dt,
+  iid_holdout = iid_holdout_dt,
+  official_future_test = future_test_dt
+)
+```
+
+# Schema and target validation (fail fast)
+
+Stage 1 establishes column names; Stage 1.5 preserves them; Stage 3 consumes them. No renaming happens in this notebook. Before any imputation, encoding, or normalization runs, this notebook checks that every split actually has the columns Stage 3 will expect, and that the target is clean — so a naming drift or a corrupted target is caught here, immediately, rather than surfacing later as a confusing `predict()` failure in Stage 3.
+
+```{r define-feature-lists}
+NUMERIC_FEATURES <- c(
+  "age", "salesPerCustomer", "returnsPerCustomer", "customerReturnRate",
+  "log_sales_customer", "log_returns_customer",
+  "avgGbpPrice", "avgDiscountValue", "salesPerProduct", "returnsPerProduct",
+  "productReturnRate", "log_sales_product", "log_returns_product",
+  "discount_ratio", "type_median_price", "price_to_type_median",
+  # value_exposure was part of Stage 1's design and feeds the cost-sensitive
+  # return-risk component later in the project, so it belongs in the Stage
+  # 1.5 / Stage 3 predictor contract too. Listing it here -- rather than
+  # silently dropping it -- means the required-column check right below will
+  # fail loudly if Stage 1 didn't actually produce it, instead of Stage 1.5
+  # and Stage 3 quietly disagreeing about whether it exists.
+  "value_exposure"
+)
+CATEGORICAL_FEATURES <- c("age_band", "shippingCountry", "productType")
+
+# BINARY_FEATURES and MISSINGNESS_FLAGS are the rest of the predictor
+# contract Stage 3 actually fits on (see its model_formula: NUMERIC_FEATURES +
+# CATEGORICAL_FEATURES + isMale + premier + customer_missing +
+# product_missing). They are listed here, explicitly, for the same reason
+# value_exposure is listed above: so the required-column check below fails
+# loudly here if one of them is missing, instead of Stage 1.5 reporting
+# "PASS" on a narrower contract while Stage 3 silently expects more columns
+# than Stage 1.5 ever validated or imputed.
+#
+# isMale / premier are genuine customer-attribute binaries that can be
+# legitimately missing (customer-join gap) and therefore need a fitted
+# imputation value, same as any numeric feature.
+BINARY_FEATURES <- c("isMale", "premier")
+# customer_missing / product_missing are join-outcome indicator flags
+# created upstream in Stage 1. They are expected to already be complete
+# (every row's join either succeeded or didn't), so they are monitored for
+# NA/type correctness but are never imputed -- imputing a "was this join
+# missing" flag would make no sense.
+MISSINGNESS_FLAGS <- c("customer_missing", "product_missing")
+# The single source of truth for "every column this pipeline must keep
+# NA-free by the time Stage 3 reads it." Used consistently by every
+# missingness audit and quality-gate check below, instead of each check
+# inventing its own (and inevitably incomplete) column list.
+MONITORED_FEATURES <- c(NUMERIC_FEATURES, CATEGORICAL_FEATURES, BINARY_FEATURES, MISSINGNESS_FLAGS)
+```
+
+```{r required-column-check}
+REQUIRED_COLUMNS <- c(
+  "customer_id", "variant_id", "isReturned",
+  NUMERIC_FEATURES, CATEGORICAL_FEATURES, BINARY_FEATURES, MISSINGNESS_FLAGS
+)
+
+for (split_name in names(all_splits)) {
+  missing_cols <- setdiff(REQUIRED_COLUMNS, names(all_splits[[split_name]]))
+  if (length(missing_cols) > 0) {
+    stop(paste(
+      split_name, "is missing required column(s):",
+      paste(missing_cols, collapse = ", ")
+    ))
+  }
+}
+cat("Confirmed: all", length(REQUIRED_COLUMNS), "required columns are present in every split.\n")
+```
+
+```{r target-validation-early}
+for (split_name in names(all_splits)) {
+  target <- all_splits[[split_name]]$isReturned
+
+  if (anyNA(target)) {
+    stop(paste(split_name, "has NA value(s) in isReturned."))
+  }
+  if (!all(unique(target) %in% c(0, 1))) {
+    stop(paste(split_name, "contains isReturned values outside {0, 1}."))
+  }
+}
+cat("Confirmed: isReturned is 0/1 with zero NA in every split.\n")
+```
+
+# Cleaning blank strings before anything else
+
+Some categorical columns in the released data contain empty strings (`""`) rather than `NA` for missing values. Left alone, a sufficiently common `""` would pass the `min_category_count` bar in the encoding step below and get treated as a legitimate category — a silent bug, not caught by any check downstream, since `""` still `!is.na()`. It's cleaned up front, once, so every later step (missingness counts, encoding, normalization) sees the same, correctly-blank-aware data. This is deliberately generic across every entry in `CATEGORICAL_FEATURES` -- `shippingCountry`, `productType`, and `age_band` alike -- rather than a one-off fix for whichever column happened to trigger an error first.
+
+```{r clean-blank-strings}
+clean_categorical <- function(x) {
+  x <- trimws(as.character(x))
+  x[x == ""] <- NA_character_
+  x
+}
+
+for (split_name in names(all_splits)) {
+  dt <- all_splits[[split_name]]
+  for (col in CATEGORICAL_FEATURES) {
+    if (col %in% names(dt)) set(dt, j = col, value = clean_categorical(dt[[col]]))
+  }
+}
+# all_splits stores data.table references, not copies, so this has already
+# updated model_train_dt, validation_dt, crc_calibration_dt, iid_holdout_dt
+# and future_test_dt in place.
+```
+
+# Missing-value audit — before preprocessing
+
+```{r missingness-before}
+missingness_before <- rbindlist(lapply(names(all_splits), function(split_name) {
+  dt <- all_splits[[split_name]]
+  cols <- MONITORED_FEATURES
+  data.table(
+    split = split_name,
+    feature = cols,
+    n_missing = sapply(cols, function(col) sum(is.na(dt[[col]]))),
+    pct_missing = sapply(cols, function(col) mean(is.na(dt[[col]])))
+  )
+}))
+
+fwrite(missingness_before, file.path(TABLE_DIR, "13_missingness_before.csv"))
+missingness_before[pct_missing > 0][order(-pct_missing)]
+```
+
+Missingness here traces directly back to the \~65–69% product-join match rate from Stage 1 (§4 of the report): every product-side feature is `NA` for the same \~31–35% of rows where `product_node_found == 0`. There is essentially no missingness on the customer side, since customer-match rates are \~95%.
+
+# Fitting the preprocessor on `model_train`
+
+Three things are fit here, all from `model_train` only:
+
+1.  **Imputation values** — the median of each numeric feature.
+2.  **Encoding scheme** — for each categorical feature, the set of levels with at least `min_category_count` rows; anything rarer (or unseen later) is recoded to `"OTHER"`.
+3.  **Normalization parameters** — mean and standard deviation of each numeric feature, for z-score scaling, computed **after** median imputation is applied to `model_train` (not on the raw, still-missing data). Fitting order matters here: imputing first adds a spike of values exactly at the median, which shifts the mean and shrinks the SD slightly relative to the raw, incomplete column. If normalization parameters were estimated on the raw column instead, the frozen mean/SD would be a small mismatch with the data every split actually gets normalized against post-imputation, and the resulting `_z` columns would land at mean ≈ -0.01 / SD ≈ 0.97 instead of the intended mean 0 / SD 1 — mathematically harmless in most cases, but not the clean, defensible normalization the project wants to lock in before Stage 3. The original (unscaled) columns are kept too, since the current baseline (logistic regression) doesn't require scaled inputs — but distance-based or regularized models added later will, so the scaled columns are computed once, here, rather than ad hoc per model.
+
+```{r fit-preprocessor}
+MIN_CATEGORY_COUNT <- 30
+
+fit_preprocessor <- function(dt, min_category_count = MIN_CATEGORY_COUNT) {
+  medians <- sapply(NUMERIC_FEATURES, function(col) median(dt[[col]], na.rm = TRUE))
+
+  # Normalization parameters are fit on model_train AFTER imputation, not
+  # before -- see the prose above. This uses a local imputed copy purely for
+  # computing mean/SD; the actual imputation applied to every split still
+  # happens in apply_preprocessor() below, driven by the frozen `medians`.
+  imputed_for_norm <- copy(dt)
+  for (col in NUMERIC_FEATURES) {
+    set(imputed_for_norm, which(is.na(imputed_for_norm[[col]])), col, medians[[col]])
+  }
+
+  norm_params <- rbindlist(lapply(NUMERIC_FEATURES, function(col) {
+    vals <- imputed_for_norm[[col]]
+    data.table(feature = col, mean = mean(vals), sd = sd(vals))
+  }))
+  setkey(norm_params, feature)
+
+  # A zero (or undefined) SD would turn (x - mean) / sd into Inf/NaN for
+  # every row of that feature -- a silent corruption, not an error, unless
+  # it's caught explicitly here. Fail fast instead.
+  degenerate <- norm_params[sd == 0 | is.na(sd)]
+  if (nrow(degenerate) > 0) {
+    stop(paste(
+      "fit_preprocessor: degenerate (zero or NA) SD for feature(s):",
+      paste(degenerate$feature, collapse = ", ")
+    ))
+  }
+
+  allowed_levels <- lapply(CATEGORICAL_FEATURES, function(col) {
+    counts <- dt[!is.na(get(col)), .N, by = col]
+    setnames(counts, col, "level")
+    counts[N >= min_category_count, level]
+  })
+  names(allowed_levels) <- CATEGORICAL_FEATURES
+
+  # Binary imputation values (mode on model_train, non-missing rows only).
+  # This was the missing piece that let isMale/premier NAs pass straight
+  # through apply_preprocessor() unimputed (they were only ever cast with
+  # as.integer(), which leaves NA as NA). Fitting a mode here, the same way
+  # medians are fit for numeric features, closes that gap.
+  binary_modes <- sapply(BINARY_FEATURES, function(col) {
+    x <- dt[[col]]
+    x <- x[!is.na(x)]
+    if (length(x) == 0) {
+      stop(paste("fit_preprocessor: no non-missing values available to compute a mode for", col))
+    }
+    as.integer(names(sort(table(x), decreasing = TRUE))[1])
+  })
+
+  list(
+    medians = medians,
+    binary_modes = binary_modes,
+    norm_params = norm_params,
+    allowed_levels = allowed_levels,
+    min_category_count = min_category_count,
+    fitted_on_n = nrow(dt)
+  )
+}
+
+preprocessor <- fit_preprocessor(model_train_dt)
+saveRDS(preprocessor, file.path(MODEL_DIR, "r_preprocessor.rds"))
+```
+
+## Encoding scheme (documented)
+
+```{r encoding-scheme}
+encoding_scheme <- rbindlist(lapply(CATEGORICAL_FEATURES, function(col) {
+  full_counts <- model_train_dt[, .N, by = col]
+  setnames(full_counts, col, "level")
+  allowed <- preprocessor$allowed_levels[[col]]
+
+  data.table(
+    feature = col,
+    total_distinct_levels = nrow(full_counts),
+    kept_as_own_level = length(allowed),
+    collapsed_to_other = nrow(full_counts) - length(allowed),
+    rows_recoded_to_other = full_counts[!(level %in% allowed), sum(N)]
+  )
+}))
+
+fwrite(encoding_scheme, file.path(TABLE_DIR, "15_encoding_scheme.csv"))
+encoding_scheme
+```
+
+`age_band` and `shippingCountry` keep nearly all of their levels (they're naturally low-cardinality); `productType` is similar. The `"OTHER"` bucket exists so that any level appearing in `validation`/`crc_calibration`/ `iid_holdout`/`official_future_test` but absent (or too rare) in `model_train` has a well-defined destination, rather than causing a "new levels" error downstream.
+
+## Normalization parameters (documented)
+
+```{r normalization-parameters}
+fwrite(preprocessor$norm_params, file.path(TABLE_DIR, "16_normalization_parameters.csv"))
+preprocessor$norm_params
+```
+
+# Applying the preprocessor to every split
+
+```{r apply-preprocessor}
+apply_preprocessor <- function(dt, preproc) {
+  dt <- copy(dt)
+  
+  # 1. Missing-value imputation (numeric)
+  for (col in names(preproc$medians)) {
+    if (col %in% names(dt)) {
+      med <- preproc$medians[[col]]
+      set(dt, which(is.na(dt[[col]])), col, med)
+    }
+  }
+  
+  # 2. Encoding (categorical)
+  for (col in names(preproc$allowed_levels)) {
+    if (col %in% names(dt)) {
+      allowed <- preproc$allowed_levels[[col]]
+      current <- dt[[col]]
+      
+      recoded <- fifelse(
+        is.na(current) | !(current %in% allowed),
+        "OTHER",
+        current
+      )
+      
+      set(
+        dt,
+        j = col,
+        value = factor(
+          recoded,
+          levels = union(allowed, "OTHER")
+        )
+      )
+    }
+  }
+  
+  # 3. Normalization
+  for (col in preproc$norm_params$feature) {
+    mu <- preproc$norm_params[feature == col, mean]
+    sigma <- preproc$norm_params[feature == col, sd]
+    
+    z_col <- paste0(col, "_z")
+    
+    if (col %in% names(dt) && sigma > 0) {
+      set(
+        dt,
+        j = z_col,
+        value = (dt[[col]] - mu) / sigma
+      )
+    }
+  }
+  
+  # 4. Binary variables -- impute NAs with the fitted mode, THEN cast.
+  # (Casting alone -- as.integer(NA) -- does not impute anything; it leaves
+  # NA as NA. This was the actual bug: isMale/premier NAs were silently
+  # passing all the way through to Stage 3.)
+  for (col in names(preproc$binary_modes)) {
+    if (col %in% names(dt)) {
+      mode_value <- preproc$binary_modes[[col]]
+      set(dt, which(is.na(dt[[col]])), col, mode_value)
+      set(dt, j = col, value = as.integer(dt[[col]]))
+    }
+  }
+
+  # customer_missing / product_missing are join-outcome flags created
+  # upstream in Stage 1. They are never imputed -- a missing "was this join
+  # missing" indicator would be a modeling error, not a legitimate gap to
+  # fill -- but they are cast to a clean integer type for consistency with
+  # the other binary predictors Stage 3 uses.
+  for (col in MISSINGNESS_FLAGS) {
+    if (col %in% names(dt)) {
+      set(dt, j = col, value = as.integer(dt[[col]]))
+    }
+  }
+  
+  dt
+}
+```
+
+# Missing-value audit — after preprocessing
+
+```{r}
+model_train_prep <- apply_preprocessor(model_train_dt, preprocessor)
+
+validation_prep <- apply_preprocessor(
+  validation_dt,
+  preprocessor
+)
+
+crc_calibration_prep <- apply_preprocessor(
+  crc_calibration_dt,
+  preprocessor
+)
+
+iid_holdout_prep <- apply_preprocessor(
+  iid_holdout_dt,
+  preprocessor
+)
+
+future_test_prep <- apply_preprocessor(
+  future_test_dt,
+  preprocessor
+)
+```
+
+```{r missingness-after}
+preprocessed_splits <- list(
+  model_train = model_train_prep,
+  validation = validation_prep,
+  crc_calibration = crc_calibration_prep,
+  iid_holdout = iid_holdout_prep,
+  official_future_test = future_test_prep
+)
+
+missingness_after <- rbindlist(lapply(names(preprocessed_splits), function(split_name) {
+  dt <- preprocessed_splits[[split_name]]
+  cols <- MONITORED_FEATURES
+  data.table(
+    split = split_name,
+    feature = cols,
+    n_missing = sapply(cols, function(col) sum(is.na(dt[[col]])))
+  )
+}))
+
+fwrite(missingness_after, file.path(TABLE_DIR, "14_missingness_after.csv"))
+
+if (any(missingness_after$n_missing > 0)) {
+  stop("Preprocessing left missing values behind -- check the imputation/encoding logic above.")
+}
+cat("Confirmed: zero missing values remain in any monitored feature, in any split.\n")
+```
+
+# Encoding preview: one-hot design matrix
+
+The baseline model in Stage 3 uses R's formula interface, which one-hot encodes factors internally — there's no separate one-hot CSV to inspect. This chunk materializes a small preview purely to document what that encoding looks like.
+
+```{r onehot-preview}
+onehot_preview <- model.matrix(
+  ~ age_band + shippingCountry + productType - 1,
+  data = model_train_prep[1:5000]
+)
+
+cat("One-hot encoded preview: ", nrow(onehot_preview), "rows x", ncol(onehot_preview), "columns\n")
+cat("Sample column names:\n")
+print(head(colnames(onehot_preview), 12))
+```
+
+# Normalization check
+
+Confirms the z-scored columns actually have mean \~0 and sd \~1 on the split they were fit on, and shows a plausible (non-zero, non-unit) result on a different split, which is expected and correct — normalization parameters are frozen from `model_train`, not re-fit per split.
+
+```{r normalization-check}
+normalization_check <- rbindlist(lapply(names(preprocessed_splits), function(split_name) {
+  dt <- preprocessed_splits[[split_name]]
+  data.table(
+    split = split_name,
+    feature = "avgGbpPrice_z",
+    mean_z = mean(dt$avgGbpPrice_z),
+    sd_z = sd(dt$avgGbpPrice_z)
+  )
+}))
+
+normalization_check
+```
+
+# Preprocessing quality gate — data validity (before writing anything)
+
+Everything above does the work; this section proves it, deliberately *before* any file is written. Each check below is independent and specific — a passed run means every failure mode it checks for (dropped rows, leftover `NA`s, blank-string categories masquerading as a real level, mismatched factor levels across splits, target leakage, `Inf` values) is confirmed absent, not just assumed absent because no error was thrown earlier. Checking cross-split compatibility here, ahead of `fwrite()`, means a bad run never gets the chance to leave a stale or inconsistent `*_prep.csv.gz` on disk for Stage 3 to pick up.
+
+```{r quality-gate-setup}
+cat("\n")
+cat("============================================================\n")
+cat("STAGE 1.5 QUALITY GATE\n")
+cat("============================================================\n\n")
+
+GATE_PASS <- TRUE
+
+fail_check <- function(message) {
+  cat("FAIL:", message, "\n")
+  GATE_PASS <<- FALSE
+}
+
+pass_check <- function(message) {
+  cat("PASS:", message, "\n")
+}
+
+prep_names <- c(
+  "model_train_prep", "validation_prep", "crc_calibration_prep",
+  "iid_holdout_prep", "future_test_prep"
+)
+```
+
+## 1. Row counts are preserved
+
+Preprocessing imputes and encodes — it must never silently drop rows.
+
+```{r gate-1-row-counts}
+row_counts_before <- c(
+  model_train = nrow(model_train_dt), validation = nrow(validation_dt),
+  crc_calibration = nrow(crc_calibration_dt), iid_holdout = nrow(iid_holdout_dt),
+  future_test = nrow(future_test_dt)
+)
+row_counts_after <- c(
+  model_train = nrow(model_train_prep), validation = nrow(validation_prep),
+  crc_calibration = nrow(crc_calibration_prep), iid_holdout = nrow(iid_holdout_prep),
+  future_test = nrow(future_test_prep)
+)
+row_check <- row_counts_before == row_counts_after
+
+if (all(row_check)) {
+  pass_check("Row counts are preserved across preprocessing.")
+} else {
+  fail_check(paste("Row count changed for:", paste(names(row_counts_before)[!row_check], collapse = ", ")))
+}
+
+data.table(split = names(row_counts_before), before = row_counts_before, after = row_counts_after)
+```
+
+## 1b. Row identity is preserved (not just row counts)
+
+Matching row *counts* before/after is necessary but not sufficient: `apply_preprocessor()` never reorders or joins, but this check confirms that directly, since CRC and the future-period drift audit implicitly depend on each split's rows keeping a stable identity. There is no single event ID in the released data, so `customer_id` + `variant_id` (in original row order) is the strongest identity check available here -- it is not guaranteed unique per event (see Stage 1's repeated-triplet finding), but an *order or content* change in either key would still be caught.
+
+```{r gate-1b-row-identity}
+identity_pairs <- list(
+  model_train = list(before = model_train_dt, after = model_train_prep),
+  validation = list(before = validation_dt, after = validation_prep),
+  crc_calibration = list(before = crc_calibration_dt, after = crc_calibration_prep),
+  iid_holdout = list(before = iid_holdout_dt, after = iid_holdout_prep),
+  future_test = list(before = future_test_dt, after = future_test_prep)
+)
+
+for (nm in names(identity_pairs)) {
+  before_dt <- identity_pairs[[nm]]$before
+  after_dt <- identity_pairs[[nm]]$after
+
+  same_customer <- identical(before_dt$customer_id, after_dt$customer_id)
+  same_variant <- identical(before_dt$variant_id, after_dt$variant_id)
+
+  if (!same_customer || !same_variant) {
+    fail_check(paste(nm, "row identity (customer_id/variant_id, in order) changed during preprocessing."))
+  } else {
+    pass_check(paste(nm, "row identity preserved (customer_id/variant_id unchanged, same order)."))
+  }
+}
+```
+
+## 2. Target remains valid 0/1
+
+```{r gate-2-target-valid}
+for (nm in prep_names) {
+  dt <- get(nm)
+  bad_target <- !is.na(dt$isReturned) & !(dt$isReturned %in% c(0, 1))
+  if (any(bad_target)) {
+    fail_check(paste(nm, "contains invalid isReturned values."))
+  } else {
+    pass_check(paste(nm, "target is valid 0/1."))
+  }
+}
+```
+
+## 3. No remaining `NA` in monitored features
+
+```{r gate-3-remaining-na}
+for (nm in prep_names) {
+  dt <- get(nm)
+  monitored <- intersect(MONITORED_FEATURES, names(dt))
+  missing_counts <- sapply(dt[, ..monitored], function(x) sum(is.na(x)))
+  bad <- missing_counts[missing_counts > 0]
+
+  if (length(bad) > 0) {
+    fail_check(paste(nm, "still contains NA:", paste(names(bad), bad, sep = "=", collapse = ", ")))
+  } else {
+    pass_check(paste(nm, "has no remaining monitored-feature NA values."))
+  }
+}
+```
+
+## 4. No blank-string categories
+
+This is the check the `clean-blank-strings` step earlier in this notebook exists to make unnecessary — it should always pass now, but stays here as a guard against a future edit accidentally reordering or removing that step.
+
+```{r gate-4-blank-strings}
+for (nm in prep_names) {
+  dt <- get(nm)
+  for (col in CATEGORICAL_FEATURES) {
+    if (!col %in% names(dt)) next
+    x <- as.character(dt[[col]])
+    blank_count <- sum(!is.na(x) & trimws(x) == "")
+
+    if (blank_count > 0) {
+      fail_check(paste(nm, "->", col, "contains", blank_count, "blank-string values."))
+    } else {
+      pass_check(paste(nm, "->", col, "has no blank-string values."))
+    }
+  }
+}
+```
+
+## 5. Factor levels are identical across every split
+
+The model needs to see the same categorical universe in training, calibration, holdout, and future-test data, or `predict()` fails with a "factor has new levels" error. This check runs before `fwrite()` on purpose: it's the direct fix for the `shippingCountry`-style "factor has new levels" failure, and there's no reason to write files to disk before confirming the thing that broke Stage 3 last time is actually fixed.
+
+```{r gate-5-factor-consistency}
+reference_dt <- model_train_prep
+
+for (col in CATEGORICAL_FEATURES) {
+  if (!is.factor(reference_dt[[col]])) {
+    fail_check(paste(col, "is not a factor in model_train_prep."))
+    next
+  }
+  reference_levels <- levels(reference_dt[[col]])
+
+  for (nm in setdiff(prep_names, "model_train_prep")) {
+    dt <- get(nm)
+    if (!is.factor(dt[[col]])) {
+      fail_check(paste(nm, col, "is not a factor."))
+      next
+    }
+    if (!identical(reference_levels, levels(dt[[col]]))) {
+      fail_check(paste("Factor levels differ for", col, "between model_train_prep and", nm))
+    } else {
+      pass_check(paste("Factor levels consistent for", col, "in", nm))
+    }
+  }
+}
+```
+
+## 6. No infinite numeric values
+
+```{r gate-6-infinite-values}
+for (nm in prep_names) {
+  dt <- get(nm)
+  numeric_cols <- intersect(NUMERIC_FEATURES, names(dt))
+  inf_counts <- sapply(dt[, ..numeric_cols], function(x) sum(is.infinite(x)))
+  bad <- inf_counts[inf_counts > 0]
+
+  if (length(bad) > 0) {
+    fail_check(paste(nm, "contains Inf:", paste(names(bad), bad, sep = "=", collapse = ", ")))
+  } else {
+    pass_check(paste(nm, "has no infinite numeric values."))
+  }
+}
+```
+
+## 7. Numeric and categorical features are the expected type
+
+```{r gate-7-types}
+for (col in NUMERIC_FEATURES) {
+  if (!col %in% names(model_train_prep)) {
+    fail_check(paste("Missing numeric feature:", col))
+  } else if (!is.numeric(model_train_prep[[col]])) {
+    fail_check(paste(col, "is not numeric."))
+  }
+}
+pass_check("Numeric feature type check completed.")
+
+for (col in CATEGORICAL_FEATURES) {
+  if (!col %in% names(model_train_prep)) {
+    fail_check(paste("Missing categorical feature:", col))
+  } else {
+    pass_check(paste("Categorical feature exists:", col))
+  }
+}
+
+for (col in c(BINARY_FEATURES, MISSINGNESS_FLAGS)) {
+  if (!col %in% names(model_train_prep)) {
+    fail_check(paste("Missing binary/missingness-flag feature:", col))
+  } else if (!is.numeric(model_train_prep[[col]]) && !is.integer(model_train_prep[[col]])) {
+    fail_check(paste(col, "is not numeric/integer after preprocessing."))
+  } else {
+    pass_check(paste("Binary/missingness-flag feature exists and is numeric:", col))
+  }
+}
+```
+
+## 8. Z-score columns exist for every numeric feature
+
+```{r gate-8-zscore-exists}
+expected_z_features <- paste0(NUMERIC_FEATURES, "_z")
+missing_z <- setdiff(expected_z_features, names(model_train_prep))
+
+if (length(missing_z) > 0) {
+  fail_check(paste("Missing z-score features:", paste(missing_z, collapse = ", ")))
+} else {
+  pass_check("All expected z-score features exist.")
+}
+```
+
+## 9. No accidental target leakage into the feature list
+
+```{r gate-9-no-leakage}
+feature_names <- c(NUMERIC_FEATURES, CATEGORICAL_FEATURES)
+
+if ("isReturned" %in% feature_names) {
+  fail_check("isReturned is incorrectly included as a predictor.")
+} else {
+  pass_check("isReturned is not included in the feature list.")
+}
+```
+
+## 10. `"OTHER"` category availability (warning-only)
+
+Not every categorical feature is guaranteed to need an `"OTHER"` bucket in `model_train` — it depends on how many rare/unseen values actually showed up. This is a warning, not a failure, for exactly that reason.
+
+```{r gate-10-other-category}
+for (col in CATEGORICAL_FEATURES) {
+  if (!col %in% names(model_train_prep)) next
+  vals <- as.character(model_train_prep[[col]])
+
+  if (!"OTHER" %in% vals) {
+    cat("WARNING:", col, "does not currently contain an OTHER observation.\n")
+  } else {
+    pass_check(paste("OTHER category available for", col))
+  }
+}
+```
+
+## Data-validity decision
+
+The data itself is either fit to write or it isn't — this stops here, before touching disk, if any check above failed.
+
+```{r gate-data-validity-decision}
+if (!GATE_PASS) {
+  cat("\n============================================================\n")
+  cat("STAGE 1.5 QUALITY GATE: FAILED (before writing any output)\n")
+  cat("Do not write preprocessed files. Fix the failing check(s) above and re-render this notebook.\n")
+  cat("============================================================\n")
+  stop("Stage 1.5 data-validity checks failed -- see the FAIL messages above.")
+}
+cat("\nAll data-validity checks passed -- proceeding to write preprocessed outputs.\n")
+```
+
+# Writing preprocessed outputs
+
+```{r write-preprocessed}
+fwrite(model_train_prep, file.path(PROCESSED_DIR, "model_train_prep.csv.gz"), compress = "gzip")
+fwrite(validation_prep, file.path(PROCESSED_DIR, "validation_prep.csv.gz"), compress = "gzip")
+fwrite(crc_calibration_prep, file.path(PROCESSED_DIR, "crc_calibration_prep.csv.gz"), compress = "gzip")
+fwrite(iid_holdout_prep, file.path(PROCESSED_DIR, "iid_holdout_prep.csv.gz"), compress = "gzip")
+fwrite(future_test_prep, file.path(PROCESSED_DIR, "official_future_test_prep.csv.gz"), compress = "gzip")
+
+message("Wrote 5 preprocessed split files to data/processed/.")
+```
+
+# Final quality gate — file existence and decision
+
+The data was already proven valid before it was written. This last step just confirms the write itself actually landed on disk, then prints the final verdict.
+
+## 11. Required preprocessed files exist
+
+```{r gate-11-files-exist}
+required_files <- c(
+  "model_train_prep.csv.gz", "validation_prep.csv.gz",
+  "crc_calibration_prep.csv.gz", "iid_holdout_prep.csv.gz",
+  "official_future_test_prep.csv.gz"
+)
+missing_files <- required_files[!file.exists(file.path(PROCESSED_DIR, required_files))]
+
+if (length(missing_files) > 0) {
+  fail_check(paste("Missing preprocessed files:", paste(missing_files, collapse = ", ")))
+} else {
+  pass_check("All five preprocessed datasets exist on disk.")
+}
+```
+
+## Final decision
+
+```{r gate-final-decision}
+cat("\n============================================================\n")
+if (GATE_PASS) {
+  cat("STAGE 1.5 QUALITY GATE: PASSED\n")
+  cat("All critical preprocessing checks passed. Stage 3 can proceed.\n")
+} else {
+  cat("STAGE 1.5 QUALITY GATE: FAILED\n")
+  cat("Do not proceed to Stage 3. Fix the failing check(s) above and re-render this notebook.\n")
+}
+cat("============================================================\n")
+
+if (!GATE_PASS) {
+  stop("Stage 1.5 quality gate failed -- see the FAIL messages above.")
+}
+```
+
+# Stage 1.5 checklist — confirm before moving on
+
+- [ ] The **required-column check** and **early target validation** at the top of the notebook passed silently (no `stop()` fired) — this confirms `value_exposure`, `isMale`, `premier`, `customer_missing`, `product_missing`, and every other Stage 1 feature actually arrived with the expected name, and `isReturned` is clean 0/1 with zero `NA`, before any transformation ran
+- [ ] `outputs/tables/13_missingness_before.csv` shows non-zero missingness concentrated in product-side features (and some customer-side missingness in `isMale`/`premier`), matching Stage 1's join-audit gap
+- [ ] `outputs/tables/14_missingness_after.csv` shows **zero** missingness across `MONITORED_FEATURES` — numeric, categorical, `isMale`/`premier`, and `customer_missing`/`product_missing` alike (the `stop()` above would have caught this otherwise)
+- [ ] `outputs/tables/15_encoding_scheme.csv` and `16_normalization_parameters.csv` both exist and look sane
+- [ ] `models/r_preprocessor.rds` exists and includes `binary_modes` for `isMale`/`premier` (fitting it would have `stop()`ped if any numeric feature had a zero or `NA` standard deviation, or if either binary feature had no non-missing values to compute a mode from)
+- [ ] The **data-validity gate** (row counts, row *identity*, target, remaining `NA` across the full monitored contract, blank strings, factor-level consistency across all five splits, `Inf` values, types including the binary/missingness-flag features, z-score columns, leakage, `OTHER` availability) passed *before* any file was written
+- [ ] `data/processed/` now additionally contains 5 `*_prep.csv.gz` files
+- [ ] **The final quality gate above printed `STAGE 1.5 QUALITY GATE: PASSED`** — if it printed `FAILED`, the render itself will have stopped; find the `FAIL:` line(s) above it and fix the underlying issue before continuing
+
+Stage 3 loads `models/r_preprocessor.rds` and these preprocessed files directly rather than re-fitting anything — so if you re-run this notebook with different parameters (e.g. a different `MIN_CATEGORY_COUNT`), re-run Stage 3 afterward too.
+
+```{r session-info}
+sessionInfo()
+```
+
+```{r}
+# ============================================================
+# NORMALIZATION + PREPROCESSING QUALITY CHECK
+# ============================================================
+
+cat("\n========================================\n")
+cat("PREPROCESSING QUALITY CHECK\n")
+cat("========================================\n")
+
+# ------------------------------------------------------------
+# 1. Check processed objects exist
+# ------------------------------------------------------------
+
+prep_objects <- c(
+  "model_train_prep",
+  "validation_prep",
+  "crc_calibration_prep",
+  "iid_holdout_prep",
+  "future_test_prep"
+)
+
+cat("\n[1] Processed objects:\n")
+
+for (nm in prep_objects) {
+  cat(
+    nm, ":", 
+    if (exists(nm)) "EXISTS" else "MISSING",
+    "\n"
+  )
+}
+
+if (!all(sapply(prep_objects, exists))) {
+  stop("Preprocessing check failed: one or more processed datasets are missing.")
+}
+
+
+# ------------------------------------------------------------
+# 2. Check numeric missing values
+# ------------------------------------------------------------
+
+cat("\n[2] Numeric missing-value check:\n")
+
+numeric_missing <- rbindlist(
+  lapply(names(
+    list(
+      model_train = model_train_prep,
+      validation = validation_prep,
+      crc_calibration = crc_calibration_prep,
+      iid_holdout = iid_holdout_prep,
+      future_test = future_test_prep
+    )
+  ), function(split_name) {
+    
+    dt <- get(paste0(
+      if (split_name == "model_train") "model_train_prep" else
+        if (split_name == "validation") "validation_prep" else
+          if (split_name == "crc_calibration") "crc_calibration_prep" else
+            if (split_name == "iid_holdout") "iid_holdout_prep" else
+              "future_test_prep"
+    ))
+    
+    rbindlist(
+      lapply(NUMERIC_FEATURES, function(col) {
+        data.table(
+          split = split_name,
+          feature = col,
+          NA_count = sum(is.na(dt[[col]]))
+        )
+      })
+    )
+  })
+)
+
+print(numeric_missing[NA_count > 0])
+
+if (any(numeric_missing$NA_count > 0)) {
+  stop("Preprocessing check failed: numeric NA values remain.")
+}
+
+cat("PASS: No numeric NA values remain.\n")
+
+
+# ------------------------------------------------------------
+# 3. Check categorical columns
+# ------------------------------------------------------------
+
+cat("\n[3] Categorical encoding check:\n")
+
+categorical_check <- rbindlist(
+  lapply(prep_objects, function(nm) {
+    
+    dt <- get(nm)
+    
+    rbindlist(
+      lapply(CATEGORICAL_FEATURES, function(col) {
+        
+        x <- dt[[col]]
+        
+        data.table(
+          split = nm,
+          feature = col,
+          class = class(x)[1],
+          is_factor = is.factor(x),
+          NA_count = sum(is.na(x)),
+          unique_levels = length(unique(x))
+        )
+      })
+    )
+  })
+)
+
+print(categorical_check)
+
+if (any(!categorical_check$is_factor)) {
+  stop("Preprocessing check failed: categorical features are not factors.")
+}
+
+if (any(categorical_check$NA_count > 0)) {
+  stop("Preprocessing check failed: categorical NA values remain.")
+}
+
+cat("PASS: Categorical variables are factors with no NA values.\n")
+
+
+# ------------------------------------------------------------
+# 4. Check factor levels are identical
+# ------------------------------------------------------------
+
+cat("\n[4] Factor-level consistency check:\n")
+
+reference_dt <- model_train_prep
+
+for (col in CATEGORICAL_FEATURES) {
+  
+  reference_levels <- levels(reference_dt[[col]])
+  
+  cat(
+    "\n", col,
+    "levels:",
+    paste(reference_levels, collapse = ", "),
+    "\n"
+  )
+  
+  for (nm in prep_objects) {
+    
+    dt <- get(nm)
+    
+    if (!identical(reference_levels, levels(dt[[col]]))) {
+      
+      stop(
+        paste0(
+          "Factor-level mismatch in ", col,
+          " for split ", nm
+        )
+      )
+    }
+  }
+}
+
+cat("PASS: Factor levels are identical across all splits.\n")
+
+
+# ------------------------------------------------------------
+# 5. Check normalized columns exist
+# ------------------------------------------------------------
+
+cat("\n[5] Normalized feature existence check:\n")
+
+Z_FEATURES <- paste0(NUMERIC_FEATURES, "_z")
+
+missing_z <- setdiff(
+  Z_FEATURES,
+  names(model_train_prep)
+)
+
+if (length(missing_z) > 0) {
+  
+  cat(
+    "Missing normalized features:\n",
+    paste(missing_z, collapse = ", "),
+    "\n"
+  )
+  
+  stop("Normalization check failed: some _z features are missing.")
+}
+
+cat(
+  "PASS:",
+  length(Z_FEATURES),
+  "normalized features found.\n"
+)
+
+
+# ------------------------------------------------------------
+# 6. Check normalization on model_train
+# ------------------------------------------------------------
+
+cat("\n[6] Model-train normalization check:\n")
+
+normalization_check <- rbindlist(
+  lapply(Z_FEATURES, function(z_col) {
+    
+    x <- model_train_prep[[z_col]]
+    
+    data.table(
+      feature = z_col,
+      mean = mean(x, na.rm = TRUE),
+      sd = sd(x, na.rm = TRUE),
+      min = min(x, na.rm = TRUE),
+      max = max(x, na.rm = TRUE),
+      NA_count = sum(is.na(x)),
+      Inf_count = sum(is.infinite(x))
+    )
+  })
+)
+
+print(normalization_check)
+
+
+# ------------------------------------------------------------
+# 7. Strict normalization validation
+# ------------------------------------------------------------
+
+mean_ok <- abs(normalization_check$mean) < 1e-8
+sd_ok <- abs(normalization_check$sd - 1) < 1e-8
+
+if (any(!mean_ok)) {
+  
+  cat(
+    "\nFeatures with incorrect mean:\n"
+  )
+  
+  print(
+    normalization_check[!mean_ok]
+  )
+  
+  stop("Normalization check failed: standardized means are not approximately 0.")
+}
+
+if (any(!sd_ok)) {
+  
+  cat(
+    "\nFeatures with incorrect SD:\n"
+  )
+  
+  print(
+    normalization_check[!sd_ok]
+  )
+  
+  stop("Normalization check failed: standardized SDs are not approximately 1.")
+}
+
+cat(
+  "PASS: Model-train normalized features have mean ≈ 0 and SD ≈ 1.\n"
+)
+
+
+# ------------------------------------------------------------
+# 8. Check NA / Inf in normalized features
+# ------------------------------------------------------------
+
+if (any(normalization_check$NA_count > 0)) {
+  stop("Normalization check failed: NA values found in _z features.")
+}
+
+if (any(normalization_check$Inf_count > 0)) {
+  stop("Normalization check failed: Inf values found in _z features.")
+}
+
+cat("PASS: No NA or Inf values in normalized features.\n")
+
+
+# ------------------------------------------------------------
+# 9. Final decision
+# ------------------------------------------------------------
+
+cat("\n========================================\n")
+cat("FINAL PREPROCESSING DECISION: PASS\n")
+cat("========================================\n")
+```

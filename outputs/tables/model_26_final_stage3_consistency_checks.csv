@@ -1,0 +1,11 @@
+check,pass
+baseline coefficients finite,TRUE
+all raw probabilities finite,TRUE
+all calibrated probabilities finite,TRUE
+"calibrated probabilities within [0,1]",TRUE
+"value exposure within [0,1]",TRUE
+calibration method valid,TRUE
+required model files exist,TRUE
+required tables exist,TRUE
+required figures exist,TRUE
+formal holdout CRC targets all met,TRUE
