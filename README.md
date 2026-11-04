@@ -75,38 +75,4 @@ quarto render 12_comprehensive_project_report.qmd
 quarto render 13_extended_statistical_analysis.qmd
 ```
 
-The original stage reports are already rendered in `files/`.
 
-## Deploy the live demo with GitHub Pages
-
-A GitHub Actions workflow is included at `.github/workflows/deploy-live-demo.yml`.
-
-1. Create a GitHub repository and push this project to its `main` branch.
-2. In GitHub, open **Settings → Pages** and set **Source** to **GitHub Actions**.
-3. Push a change to `main`, or run **Deploy live demo to GitHub Pages** manually from the repository’s **Actions** tab.
-4. GitHub will show the deployed URL in the completed workflow, normally:
-
-   ```text
-   https://YOUR-GITHUB-USERNAME.github.io/YOUR-REPOSITORY-NAME/
-   ```
-
-The Pages build publishes only the standalone `live_demo/` directory. Large raw data, trained model artifacts and restricted project files are not published.
-
-## Reproducibility and responsible sharing
-
-- Do not publish data that is private, licence-restricted or too large for GitHub.
-- The outputs, figures and reports support traceability without requiring the raw data to be public.
-- Pin R package versions with `renv` before a public release.
-- Re-run the full pipeline in stage order if raw data or modelling decisions change.
-
-## Team
-
-| Name | Registration number |
-|---|---|
-| [Team Member 1] | [Registration Number] |
-| [Team Member 2] | [Registration Number] |
-| [Team Member 3] | [Registration Number] |
-
-## License
-
-Add a license before publishing the repository publicly.
