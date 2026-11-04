@@ -93,22 +93,4 @@ A GitHub Actions workflow is included at `.github/workflows/deploy-live-demo.yml
 
 The Pages build publishes the standalone `live_demo/` directory as the site home page and the rendered HTML reports in `files/`. Large raw data, trained model artifacts and restricted project files are not published.
 
-## Reproducibility and responsible sharing
-
-- Do not publish data that is private, licence-restricted or too large for GitHub.
-- The outputs, figures and reports support traceability without requiring the raw data to be public.
-- Pin R package versions with `renv` before a public release.
-- Re-run the full pipeline in stage order if raw data or modelling decisions change.
-
-## Team
-
-| Name | Registration number |
-|---|---|
-| [Team Member 1] | [Registration Number] |
-| [Team Member 2] | [Registration Number] |
-| [Team Member 3] | [Registration Number] |
-
-## License
-
-Add a license before publishing the repository publicly.
 
